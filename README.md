@@ -56,7 +56,13 @@ Only the current project directory is mounted. The extension does not forward Pi
 
 ## Package installation
 
-The embedded image is based on `debian:stable-slim` and contains only basic Debian packages. The `sandbox` tool exposes one privileged operation:
+The embedded image is based on `debian:stable-slim` and contains only basic Debian packages. The `sandbox` tool exposes two operations:
+
+```json
+{ "list": true }
+```
+
+Lists only packages explicitly added through `sandbox.pkg_add`. Debian dependencies and packages included in the base image are not included.
 
 ```json
 { "pkg_add": "ripgrep" }
@@ -69,7 +75,7 @@ apt-get update
 apt-get install -y --no-install-recommends ripgrep
 ```
 
-APT upgrade is deliberately not exposed or performed automatically. Upgrading the whole base environment during a coding session can unexpectedly change tool behavior; update the embedded image instead when the base image should change.
+The extension records the explicitly requested package name separately from APT's dependency graph. APT upgrade is deliberately not exposed or performed automatically. Updating the embedded image is preferred when the base environment should change.
 
 Only Debian package-name syntax is accepted for `pkg_add`. npm, pip, cargo, URLs, local `.deb` files, and shell fragments are rejected.
 

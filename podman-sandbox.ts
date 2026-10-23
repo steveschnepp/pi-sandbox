@@ -42,9 +42,10 @@ RUN apt-get update \\
     && rm -rf /var/lib/apt/lists/*
 `;
 
-const packageSchema = Type.Object({
-  pkg_add: Type.String({ minLength: 1 }),
-});
+const packageSchema = Type.Union([
+  Type.Object({ list: Type.Literal(true) }),
+  Type.Object({ pkg_add: Type.String({ minLength: 1 }) }),
+]);
 
 type RunOptions = {
   cwd?: string;
@@ -241,16 +242,28 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Add an official Debian package inside the sandbox as root. APT metadata is refreshed automatically. Ordinary commands run as the unprivileged sandbox user.",
+    description: "Inspect or modify sandbox-owned Debian packages. Use list to show packages explicitly added through this tool, or pkg_add to install one package. APT metadata is refreshed automatically for installs.",
     parameters: packageSchema,
     async execute(_id, input, signal, onUpdate) {
       if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
         throw new Error("pkg_add accepts Debian package names only");
       }
       const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
-      // Refresh metadata transparently before every installation.
-      const command = `apt-get update && apt-get install -y --no-install-recommends ${quoted}`;
-      const result = await exec(command, { cwd: hostCwd, user: "0", signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
+      let command: string;
+      let user: string | undefined;
+      if ("list" in input) {
+        command = "sort -u /tmp/pi-sandbox-explicit-packages 2>/dev/null || true";
+      } else {
+        if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
+          throw new Error("pkg_add accepts Debian package names only");
+        }
+        const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
+        // Refresh metadata transparently before every installation. Track only
+        // packages explicitly requested through this tool, not dependencies.
+        command = `apt-get update && apt-get install -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`;
+        user = "0";
+      }
+      const result = await exec(command, { cwd: hostCwd, user, signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
       return { content: [{ type: "text", text: result.output }], details: { exitCode: result.code }, isError: result.code !== 0 };
     },
   });
