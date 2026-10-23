@@ -27,13 +27,17 @@ podman run -d \
   --volume "$project:$project:rw" \
   --workdir "$project" \
   --cap-drop=ALL \
+  --cap-add=SETUID \
+  --cap-add=SETGID \
+  --cap-add=CHOWN \
+  --cap-add=DAC_OVERRIDE \
   --security-opt=no-new-privileges \
   "$image" sleep infinity >"$scratch/run.out"
 
 podman exec "$container" id >"$scratch/id.out"
 podman exec "$container" sh -lc 'touch regular-file && stat -c "%u:%g" regular-file' >"$scratch/file.out"
 podman exec --user 0 "$container" id >"$scratch/root-id.out"
-podman exec --user 0 "$container" sh -lc 'apt-get update >apt-update.log && apt-get install -y --no-install-recommends file >>apt-update.log' >"$scratch/apt.out" 2>"$scratch/apt.err"
+podman exec --user 0 "$container" sh -lc 'apt-get update >/tmp/apt-update.log && apt-get install -y --no-install-recommends file >>/tmp/apt-update.log' >"$scratch/apt.out" 2>"$scratch/apt.err"
 podman exec "$container" sh -lc 'command -v file && id' >"$scratch/installed.out"
 
 printf '%s\n' '-- ordinary identity --'

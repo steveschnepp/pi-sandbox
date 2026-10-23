@@ -158,7 +158,9 @@ export default function (pi: ExtensionAPI) {
         "--volume", `${hostCwd}:${hostCwd}:rw`,
         "--userns=keep-id", "--user", `${hostUid}:${hostGid}`,
         "--workdir", hostCwd,
-        "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--cap-drop=ALL",
+        "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE",
+        "--security-opt=no-new-privileges",
         "--pids-limit=512", image, "sleep", "infinity",
       ]);
       started = true;
