@@ -39,6 +39,12 @@ podman exec "$container" sh -lc 'touch regular-file && stat -c "%u:%g" regular-f
 podman exec --user 0 "$container" id >"$scratch/root-id.out"
 podman exec --user 0 "$container" sh -lc 'apt-get update >/tmp/apt-update.log && apt-get install -y --no-install-recommends file >>/tmp/apt-update.log' >"$scratch/apt.out" 2>"$scratch/apt.err"
 podman exec "$container" sh -lc 'command -v file && id' >"$scratch/installed.out"
+if podman exec "$container" apt-get remove -y file >"$scratch/remove.out" 2>"$scratch/remove.err"; then
+  printf 'non-root package removal unexpectedly succeeded\\n' >&2
+  exit 1
+else
+  printf 'blocked\\n' >"$scratch/remove-blocked.out"
+fi
 
 printf '%s\n' '-- ordinary identity --'
 cat "$scratch/id.out"
@@ -48,5 +54,7 @@ printf '%s\n' '-- package identity --'
 cat "$scratch/root-id.out"
 printf '%s\n' '-- installed Debian package --'
 cat "$scratch/installed.out"
+printf '%s\n' '-- package removal --'
+cat "$scratch/remove-blocked.out"
 printf '%s\n' '-- host ownership --'
 stat -c '%u:%g %n' "$project/regular-file"

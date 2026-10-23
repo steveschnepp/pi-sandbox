@@ -75,6 +75,8 @@ apt-get update
 apt-get install -y --no-install-recommends ripgrep
 ```
 
+Installation uses APT's `--no-remove` option. There is no remove or uninstall operation, and ordinary non-root commands cannot modify the package database. If a requested package would require removing another package, installation fails instead.
+
 The extension records the explicitly requested package name separately from APT's dependency graph. APT upgrade is deliberately not exposed or performed automatically. Updating the embedded image is preferred when the base environment should change.
 
 Only Debian package-name syntax is accepted for `pkg_add`. npm, pip, cargo, URLs, local `.deb` files, and shell fragments are rejected.

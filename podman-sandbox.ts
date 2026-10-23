@@ -260,7 +260,7 @@ export default function (pi: ExtensionAPI) {
         const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
         // Refresh metadata transparently before every installation. Track only
         // packages explicitly requested through this tool, not dependencies.
-        command = `apt-get update && apt-get install -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`;
+        command = `apt-get update && apt-get install --no-remove -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`;
         user = "0";
       }
       const result = await exec(command, { cwd: hostCwd, user, signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
