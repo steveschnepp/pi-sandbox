@@ -56,28 +56,22 @@ Only the current project directory is mounted. The extension does not forward Pi
 
 ## Package installation
 
-The embedded image is based on `debian:stable-slim` and contains only basic Debian packages. The `sandbox` tool exposes three privileged operations:
-
-```json
-{ "apt_update": true }
-```
-
-```json
-{ "apt_upgrade": true }
-```
+The embedded image is based on `debian:stable-slim` and contains only basic Debian packages. The `sandbox` tool exposes one privileged operation:
 
 ```json
 { "pkg_add": "ripgrep" }
 ```
 
-`apt_update` runs `apt-get update`. `apt_upgrade` runs `apt-get update && apt-get upgrade -y`. `pkg_add` always refreshes APT metadata before installing:
+APT metadata refresh is transparent. The operation runs inside the existing container as container root:
 
 ```bash
 apt-get update
 apt-get install -y --no-install-recommends ripgrep
 ```
 
-Only one operation may be supplied per call. Only Debian package-name syntax is accepted for `pkg_add`. npm, pip, cargo, URLs, local `.deb` files, and shell fragments are rejected.
+APT upgrade is deliberately not exposed or performed automatically. Upgrading the whole base environment during a coding session can unexpectedly change tool behavior; update the embedded image instead when the base image should change.
+
+Only Debian package-name syntax is accepted for `pkg_add`. npm, pip, cargo, URLs, local `.deb` files, and shell fragments are rejected.
 
 Container UID 0 is namespaced by `--userns=keep-id`; it is not host root.
 

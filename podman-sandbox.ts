@@ -42,11 +42,9 @@ RUN apt-get update \\
     && rm -rf /var/lib/apt/lists/*
 `;
 
-const packageSchema = Type.Union([
-  Type.Object({ apt_update: Type.Literal(true) }),
-  Type.Object({ apt_upgrade: Type.Literal(true) }),
-  Type.Object({ pkg_add: Type.String({ minLength: 1 }) }),
-]);
+const packageSchema = Type.Object({
+  pkg_add: Type.String({ minLength: 1 }),
+});
 
 type RunOptions = {
   cwd?: string;
@@ -243,22 +241,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Manage official Debian packages inside the sandbox as root. Use exactly one operation: apt_update, apt_upgrade, or pkg_add.",
+    description: "Add an official Debian package inside the sandbox as root. APT metadata is refreshed automatically. Ordinary commands run as the unprivileged sandbox user.",
     parameters: packageSchema,
     async execute(_id, input, signal, onUpdate) {
-      let command: string;
-      if ("apt_update" in input) {
-        command = "apt-get update";
-      } else if ("apt_upgrade" in input) {
-        command = "apt-get update && apt-get upgrade -y";
-      } else {
-        if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
-          throw new Error("pkg_add accepts Debian package names only");
-        }
-        const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
-        // Always refresh package metadata before installing.
-        command = `apt-get update && apt-get install -y --no-install-recommends ${quoted}`;
+      if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
+        throw new Error("pkg_add accepts Debian package names only");
       }
+      const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
+      // Refresh metadata transparently before every installation.
+      const command = `apt-get update && apt-get install -y --no-install-recommends ${quoted}`;
       const result = await exec(command, { cwd: hostCwd, user: "0", signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
       return { content: [{ type: "text", text: result.output }], details: { exitCode: result.code }, isError: result.code !== 0 };
     },
