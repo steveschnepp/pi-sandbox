@@ -93,7 +93,11 @@ function runPodmanInput(args: string[], input: string, cwd: string): Promise<voi
   });
 }
 
-function globToRegex(pattern: string): RegExp {
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+
   const escaped = pattern.replace(/[.+^${}()|[\\]\\\\]/g, "\\\\$&");
   return new RegExp(`^${escaped.replaceAll("**", ".*").replaceAll("*", "[^/]*").replaceAll("?", ".")}$`);
 }
@@ -245,10 +249,6 @@ export default function (pi: ExtensionAPI) {
     description: "Inspect or modify sandbox-owned Debian packages. Use list to show packages explicitly added through this tool, or pkg_add to install one package. APT metadata is refreshed automatically for installs.",
     parameters: packageSchema,
     async execute(_id, input, signal, onUpdate) {
-      if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
-        throw new Error("pkg_add accepts Debian package names only");
-      }
-      const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
       let command: string;
       let user: string | undefined;
       if ("list" in input) {
@@ -265,6 +265,44 @@ export default function (pi: ExtensionAPI) {
       }
       const result = await exec(command, { cwd: hostCwd, user, signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
       return { content: [{ type: "text", text: result.output }], details: { exitCode: result.code }, isError: result.code !== 0 };
+    },
+  });
+
+  pi.registerCommand("sandbox", {
+    description: "Manage the Podman sandbox (refresh, upgrade, add, remove, list)",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const operation = parts.shift();
+      const packageName = parts.shift();
+      if (parts.length > 0 || !operation || (operation !== "list" && !packageName)) {
+        ctx.ui.notify("Usage: /sandbox list|refresh|upgrade|add <package>|remove <package>", "warning");
+        return;
+      }
+      if (packageName && !/^[a-z0-9][a-z0-9+.-]*$/.test(packageName)) {
+        ctx.ui.notify("Invalid Debian package name", "error");
+        return;
+      }
+      const quoted = packageName ? shellQuote(packageName) : "";
+      const commands: Record<string, { command: string; user?: string }> = {
+        list: { command: "sort -u /tmp/pi-sandbox-explicit-packages 2>/dev/null || true" },
+        refresh: { command: "apt-get update", user: "0" },
+        upgrade: { command: "apt-get update && apt-get upgrade -y", user: "0" },
+        add: { command: `apt-get update && apt-get install --no-remove -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`, user: "0" },
+        remove: { command: `apt-get remove -y ${quoted} && (grep -vxF ${quoted} /tmp/pi-sandbox-explicit-packages > /tmp/pi-sandbox-explicit-packages.new 2>/dev/null || true) && (test -f /tmp/pi-sandbox-explicit-packages.new && mv /tmp/pi-sandbox-explicit-packages.new /tmp/pi-sandbox-explicit-packages || true)`, user: "0" },
+      };
+      const selected = commands[operation];
+      if (!selected) {
+        ctx.ui.notify("Unknown sandbox operation", "warning");
+        return;
+      }
+      try {
+        const result = await exec(selected.command, { cwd: hostCwd, user: selected.user });
+        const output = result.output.trim();
+        if (result.code !== 0) throw new Error(output || `exit code ${result.code}`);
+        ctx.ui.notify(output ? output.slice(-2000) : `${operation} completed`, "info");
+      } catch (error) {
+        ctx.ui.notify(`${operation} failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
     },
   });
 

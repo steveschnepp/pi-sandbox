@@ -89,7 +89,20 @@ File paths are resolved with `realpath` before access. Existing paths must resol
 
 The file tools currently use Pi's host-side filesystem APIs with these project-boundary checks. Bash and `find` execute in the container. Pi's built-in grep implementation performs its traversal internally, so its traversal is not fully containerized yet; its file-read callbacks remain guarded.
 
-## Security limitations
+## User-controlled sandbox maintenance
+
+LLM tools cannot remove packages or upgrade the sandbox. Those operations are available only through the user-facing slash command:
+
+```text
+/sandbox list
+/sandbox refresh
+/sandbox upgrade
+/sandbox add <debian-package>
+/sandbox remove <debian-package>
+```
+
+`refresh` runs `apt-get update`, `upgrade` runs `apt-get update && apt-get upgrade -y`, and `remove` runs APT removal as container root. `/sandbox add` is equivalent to `pkg_add` and records the package in the sandbox-owned list. Invalid package names and unknown operations are rejected by the command handler.
+
 
 This extension is a local development boundary, not a complete security sandbox:
 
