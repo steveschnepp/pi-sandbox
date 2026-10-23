@@ -97,7 +97,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-
+function globToRegex(pattern: string): RegExp {
   const escaped = pattern.replace(/[.+^${}()|[\\]\\\\]/g, "\\\\$&");
   return new RegExp(`^${escaped.replaceAll("**", ".*").replaceAll("*", "[^/]*").replaceAll("?", ".")}$`);
 }
