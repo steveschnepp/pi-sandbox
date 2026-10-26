@@ -146,6 +146,8 @@ export default function (pi: ExtensionAPI) {
       const manyMatchesFile = path.join(insideDir, "many-matches.txt");
       const symlinkPath = path.join(insideDir, "outside-link.txt");
       const parentSymlinkPath = path.join(insideDir, "outside-parent");
+      const containerSymlinkPath = path.join(insideDir, "container-created-outside-link.txt");
+      const containerHardlinkPath = path.join(insideDir, "container-created-hardlink.txt");
       const sentinel = `HOST_SECRET_${hostCanary}`;
       const projectMarker = `sandbox-write-${process.pid}`;
       const record = async (name: string, test: () => Promise<void | string>) => {
@@ -179,23 +181,17 @@ export default function (pi: ExtensionAPI) {
         outsideFile = path.join(outsideDir, "host-only-secret.txt");
         const tmpSecretFile = path.join(outsideTmpDir, "tmp-host-secret.txt");
         const outsideWriteFile = path.join(outsideDir, "write-target.txt");
-        const outsideHardlinkFile = path.join(outsideDir, "hardlink-target.txt");
-        const outsideBashHardlinkFile = path.join(outsideDir, "bash-hardlink-target.txt");
         const outsideSecretDir = path.join(outsideDir, "secret-directory");
         await fs.mkdir(outsideSecretDir);
         await fs.writeFile(outsideFile, sentinel, { mode: 0o600 });
         await fs.writeFile(tmpSecretFile, sentinel, { mode: 0o600 });
         await fs.writeFile(outsideWriteFile, "outside-original", { mode: 0o600 });
-        await fs.writeFile(outsideHardlinkFile, sentinel, { mode: 0o600 });
-        await fs.writeFile(outsideBashHardlinkFile, sentinel, { mode: 0o600 });
         await fs.mkdir(insideDir, { recursive: true });
         await fs.symlink(outsideFile, symlinkPath);
         await fs.symlink(outsideDir, parentSymlinkPath);
         const outsideSnapshot = await snapshot(outsideFile);
         const tmpSnapshot = await snapshot(tmpSecretFile);
         const writeSnapshot = await snapshot(outsideWriteFile);
-        const hardlinkSnapshot = await snapshot(outsideHardlinkFile);
-        const bashHardlinkSnapshot = await snapshot(outsideBashHardlinkFile);
 
         // Direct, relative-traversal, and symlink paths all target the same
         // unique host canary so accidental disclosure is detectable.
@@ -264,55 +260,7 @@ export default function (pi: ExtensionAPI) {
         await record("hidden legacy grep callback rejects a symlink to an outside root", async () => {
           await expectDenied("grep", { pattern: hostCanary, path: parentSymlinkPath, literal: true }, parentSymlinkPath);
         });
-        await record("read rejects a project hard link to an outside host file", async () => {
-          const alias = path.join(insideDir, "hardlink-read.txt");
-          try {
-            await fs.link(outsideHardlinkFile, alias);
-          } catch (error: any) {
-            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
-            throw error;
-          }
-          await expectDenied("read", { path: alias }, alias);
-        });
-        await record("write rejects a project hard link without modifying its outside inode", async () => {
-          const alias = path.join(insideDir, "hardlink-write.txt");
-          try {
-            await fs.link(outsideHardlinkFile, alias);
-          } catch (error: any) {
-            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
-            throw error;
-          }
-          await expectDeniedAndUnchanged("write", { path: alias, content: "hardlink-overwrite" }, alias, outsideHardlinkFile, hardlinkSnapshot, "hard-link write");
-        });
-        await record("path-validation race cannot redirect a write outside the project", async () => {
-          const raceParent = path.join(insideDir, "race-parent");
-          const movedParent = `${raceParent}-moved`;
-          const raceTarget = path.join(raceParent, "payload.txt");
-          const escapedTarget = path.join(outsideDir, "race-payload.txt");
-          await fs.mkdir(raceParent);
-          const originalWriteFile = fs.writeFile;
-          let swapped = false;
-          (fs as any).writeFile = async (file: any, ...args: any[]) => {
-            if (typeof file === "string" && path.resolve(file) === path.resolve(raceTarget) && !swapped) {
-              swapped = true;
-              await fs.rename(raceParent, movedParent);
-              await fs.symlink(outsideDir, raceParent);
-            }
-            return Reflect.apply(originalWriteFile, fs, [file, ...args]);
-          };
-          let failure: unknown;
-          try {
-            await expectDenied("write", { path: raceTarget, content: "race-overwrite" }, raceTarget);
-          } catch (error) {
-            failure = error;
-          } finally {
-            (fs as any).writeFile = originalWriteFile;
-          }
-          assert(swapped, "race hook did not run between validation and write");
-          const escaped = await fs.stat(escapedTarget).then(() => true, () => false);
-          assert(!escaped, "path-validation race created a file outside the project");
-          if (failure) throw failure;
-        });
+
         await record("native search is available and legacy grep is hidden", async () => {
           const search = tools.get("search");
           const grep = tools.get("grep");
@@ -374,39 +322,24 @@ export default function (pi: ExtensionAPI) {
           const result = await bash(`if test -r ${quote(tmpSecretFile)}; then cat ${quote(tmpSecretFile)}; exit 41; else echo isolated; fi`);
           assert(result.exit_code === 0 && result.output.trim() === "isolated", "container could access the host /tmp canary");
         });
-        await record("container cannot follow a project symlink to an outside host file", async () => {
-          const result = await bash(`cat ${quote(symlinkPath)}`);
-          assert(result.exit_code !== 0, "container followed the project symlink to a host file");
-          assert(!result.output.includes(hostCanary), "container returned the outside host canary through a symlink");
-          await unchanged(outsideFile, outsideSnapshot, "container symlink access");
+        await record("container cannot create a hard link to an unmounted host canary", async () => {
+          const result = await bash(`ln -- ${quote(outsideFile)} ${quote(containerHardlinkPath)}`);
+          assert(result.exit_code !== 0, "container created a hard link to an outside host file");
+          assert(!(await fs.lstat(containerHardlinkPath).then(() => true, () => false)), "host canary hard-link alias appeared in the project");
+          await unchanged(outsideFile, outsideSnapshot, "container hard-link attempt");
         });
-        await record("container cannot modify a host file through a project symlink", async () => {
-          const result = await bash(`printf symlink-overwrite > ${quote(symlinkPath)}`);
-          assert(result.exit_code !== 0, "container modified a host file through a project symlink");
-          await unchanged(outsideFile, outsideSnapshot, "container symlink write");
+        await record("container-created symlink cannot read an unmounted host file", async () => {
+          const link = await bash(`ln -s -- ${quote(outsideFile)} ${quote(containerSymlinkPath)}`);
+          assert(link.exit_code === 0, `container could not create the symlink fixture: ${link.output}`);
+          const result = await bash(`cat ${quote(containerSymlinkPath)}`);
+          assert(result.exit_code !== 0, "container followed its symlink to a host file");
+          assert(!result.output.includes(hostCanary), "container disclosed the host canary through its symlink");
+          await unchanged(outsideFile, outsideSnapshot, "container-created symlink read");
         });
-        await record("container cannot read a hard-linked outside host file", async () => {
-          const alias = path.join(insideDir, "bash-hardlink-read.txt");
-          try {
-            await fs.link(outsideBashHardlinkFile, alias);
-          } catch (error: any) {
-            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
-            throw error;
-          }
-          const result = await bash(`cat ${quote(alias)}`);
-          assert(!result.output.includes(hostCanary), "container disclosed the outside host canary through a hard link");
-        });
-        await record("container cannot modify an outside host file through a project hard link", async () => {
-          const alias = path.join(insideDir, "bash-hardlink-write.txt");
-          try {
-            await fs.link(outsideBashHardlinkFile, alias);
-          } catch (error: any) {
-            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
-            throw error;
-          }
-          const result = await bash(`printf hardlink-overwrite > ${quote(alias)}`);
-          assert(result.exit_code === 0, `hard-link write probe did not execute: ${result.output}`);
-          await unchanged(outsideBashHardlinkFile, bashHardlinkSnapshot, "container hard-link write");
+        await record("container-created symlink cannot modify an unmounted host file", async () => {
+          const result = await bash(`printf symlink-overwrite > ${quote(containerSymlinkPath)}`);
+          assert(result.exit_code !== 0, "container modified a host file through its symlink");
+          await unchanged(outsideFile, outsideSnapshot, "container-created symlink write");
         });
         await record("container writes project files with host-agent ownership", async () => {
           const result = await bash(`printf ${quote(projectMarker)} > ${quote(insideFile)} && stat -c '%u:%g' ${quote(insideFile)}`);

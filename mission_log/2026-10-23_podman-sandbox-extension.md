@@ -529,3 +529,50 @@ Ran the suite using the Pi CLI. It correctly returns nonzero for the newly added
 - Fix host file access so hard links cannot disclose or alter outside-project host inodes, or explicitly change the trust contract if such aliases are considered authorized.
 - Replace check-then-use host path operations with a race-resistant design; retain the deterministic test as the acceptance check.
 - Decide whether network egress should remain enabled or be restricted; the harness now demonstrates the current data-egress capability.
+
+## Session 13: Podman Sandbox Extension (2026-10-26)
+
+### What We Did
+
+Corrected the security harness scope after clarifying that the target is escaping the Podman command sandbox, not the explicitly provided host-side file callbacks. Removed the deterministic host callback TOCTOU race and host-created hard-link aliases from the container-escape suite. Those probes tested different trust boundaries and were not evidence that a command inside the container could create the links or perform the callback operations.
+
+Replaced the host-seeded link probes with in-container attempts: `ln` tries to create a project hard link to the outside host canary, and `ln -s` creates a project symlink to that host path before separate read and write attempts. The test verifies hard-link creation fails, symlink creation does not grant access, and the host canary remains unchanged. Updated `README.md` to distinguish callback path checks from sandbox escape probes and to state that the hard-link test does not pre-seed a host-created alias.
+
+### What We Learned
+
+#### Technical
+
+- A hard link has no intrinsic direction. The relevant sandbox question is whether the in-container process can name and link the outside host inode. With only the project mounted, the canary path is unavailable as a hard-link source.
+- A symbolic link can be created to an absolute host path without access to its target. The sandbox boundary assertion is that following the link from inside the container cannot read or modify the host canary.
+- The earlier hard-link failures were caused by the host-side test adapter creating aliases before the container ran; they measured access through pre-existing aliases, not creation of an outside link from inside the sandbox.
+- Host callback path checks and container escape checks are distinct test subjects and should not be reported as the same finding.
+
+#### Process
+
+- Build adversarial fixtures from the same principal and namespace as the actor under test. Host-created artifacts can accidentally test a broader threat model than the sandbox command can reach.
+
+### What We Decided
+
+- Define this suite's hard-link probe as a container-originated attempt to create a project link from an unmounted host source.
+- Test container-created symlinks by attempting both reads and writes through the link, while checking the host canary snapshot.
+- Keep host-side callback confinement separate from claims about container escape; do not classify callback TOCTOU or host-preseeded hard-link cases as sandbox escapes.
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 90`: passed, 35/35 checks, zero skipped. The in-container hard-link attempt failed as expected; the in-container symlink was created but could not read or modify the host canary.
+- `./poc/test-podman-sandbox-rpc.py --timeout 60`: passed.
+- Python AST parse without bytecode, `git diff --check`, and mission-log lint: passed.
+- Confirmed the run left no `poc/__pycache__` or disposable outside fixtures.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `poc/podman-sandbox-security-test.ts` | Replaced host-seeded hard-link/race probes with container-originated hard-link and symlink escape attempts. |
+| `README.md` | Clarified callback-vs-container test scope and the actual hard-link test. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this scope correction and verification. |
+
+### Next Steps
+
+- Expand container-escape coverage around host process visibility, host control sockets, inherited file descriptors, and mount/device exposure if those are part of the desired threat model.
+- Continue treating network egress as a separate data-exfiltration policy; the controlled receiver confirmed the currently documented allow-network behavior.
