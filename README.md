@@ -95,7 +95,7 @@ The tool accepts a regular expression by default, with optional literal matching
 
 File paths are resolved with `realpath` before access. Existing paths must resolve below the project root. New files are checked by resolving their parent directory, which prevents ordinary `..` and symlink escapes.
 
-The file tools currently use Pi's host-side filesystem APIs with these project-boundary checks. Bash and `find` execute in the container. The model-facing grep traversal is disabled in favor of the container-backed `search` tool; host-side file callbacks remain guarded.
+The file tools currently use Pi's host-side filesystem APIs with project-boundary checks. These are explicit host-side tool capabilities, not operations inside the Podman container. Bash, `find`, and native `search` execute in the container; the model-facing grep traversal is disabled in favor of `search`. The security tests report host-callback path checks separately from attempts to escape the command container.
 
 ## User-controlled sandbox maintenance
 
@@ -140,7 +140,7 @@ For security-boundary coverage, run the registered tools against disposable host
 ./poc/test-podman-sandbox-rpc.py --security --image debian:stable-slim
 ```
 
-The security suite exercises the registered tools against disposable host and container fixtures. It tests absolute and traversal paths, host-side callback path checks, symlink and parent-symlink behavior, outside canary disclosure through tool results/RPC/stderr, unchanged host-file snapshots after mutation attempts, container identity and project ownership, capability dropping, dpkg protection, package-input validation, and bounded structured search. From inside the container it attempts to create a hard link to an unmounted host canary, then creates a symlink to that host path and verifies the link cannot read or modify the canary. The hard-link probe tests source-path visibility from the container; it does not pre-seed a host-created hard link in the project. A controlled host TCP receiver also reports whether mounted project data can egress; network access is currently allowed by policy, so that result is an audit observation rather than a failure. The suite does not need an LLM provider. Omit `--image` to cover the embedded-image build path as well.
+The security suite exercises disposable host and container fixtures, but separates the two boundaries. Host-side callback tests check that explicit file-tool operations stay within the project. Container-escape probes run commands inside Podman and test absolute/traversal access to host canaries, whether the container can create a hard link to an unmounted host file, and whether a container-created symlink can read or modify that file. They also check canary disclosure through tool results/RPC/stderr, host-file snapshots, container identity and project ownership, capability dropping, dpkg protection, package-input validation, and bounded structured search. A controlled host TCP receiver reports whether mounted project data can egress; network access is currently allowed by policy, so that result is an audit observation rather than a failure. The suite does not need an LLM provider. Omit `--image` to cover the embedded-image build path as well.
 
 The user-namespace and privilege behavior can be tested separately with:
 

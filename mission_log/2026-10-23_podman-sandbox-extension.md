@@ -576,3 +576,28 @@ Replaced the host-seeded link probes with in-container attempts: `ln` tries to c
 
 - Expand container-escape coverage around host process visibility, host control sockets, inherited file descriptors, and mount/device exposure if those are part of the desired threat model.
 - Continue treating network egress as a separate data-exfiltration policy; the controlled receiver confirmed the currently documented allow-network behavior.
+
+## Session 14: Podman Sandbox Extension (2026-10-26)
+
+### What We Did
+
+After the user clarified that the primary concern is escaping the Podman command sandbox, not using an explicitly provided host-side callback, clarified the README boundary description. It now states that Pi file tools run as explicit host-side capabilities, while bash, find, and native search execute in the container. The test description distinguishes callback path checks from container-escape attempts and describes the in-container `ln` and `ln -s` probes.
+
+Reviewed documentation references for stale harness counts and descriptions. Historical mission-log sessions retain their original findings as required by append-only policy; the later scope-correction session records the corrected interpretation.
+
+### What We Decided
+
+- Keep the documentation explicit that callback-based host file access and Podman command execution are separate boundaries.
+- Describe the test suite by boundary so callback behavior is not mistaken for a container escape result.
+
+### Test Results / Benchmarks
+
+- `git diff --check`: passed.
+- The current README describes the 35-check suite and the in-container hard-link/symlink probes; no additional documentation file required changes.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Separates host-side file callback capabilities from the container boundary and clarifies security-test scope. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this documentation clarification. |
