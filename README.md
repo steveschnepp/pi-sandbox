@@ -18,7 +18,7 @@ Run Pi from the project directory:
 pi -e ./podman-sandbox.ts
 ```
 
-The extension lazily builds an image from its embedded Dockerfile and starts one container for the Pi session. The project directory is mounted at the same absolute path inside the container.
+The extension checks that rootless Podman is available and verifies or builds the embedded image during Pi's `session_start`. It starts one container on the first sandboxed operation, mounts the project at the same absolute path, reuses the container for the Pi session, and removes it at shutdown.
 
 A pre-built image can be selected with:
 
@@ -37,7 +37,9 @@ The container is started with:
 --user <Pi-agent-UID>:<Pi-agent-GID>
 ```
 
-Normal commands therefore run as the same non-root user as the Pi agent. Files created through the project mount retain the Pi agent's ownership.
+Normal commands therefore run as the same non-root user as the Pi agent. The selected APT capabilities are also present on the container's exec process, so the extension uses `setpriv` to clear inherited, ambient, and effective capabilities before running every ordinary command. The embedded image includes `util-linux` for `setpriv`; a custom image must provide it. Package-maintenance operations execute separately as namespaced container root and retain the capabilities needed by APT.
+
+Files created through the project mount retain the Pi agent's ownership.
 
 The container also uses:
 
@@ -50,7 +52,7 @@ The container also uses:
 --security-opt=no-new-privileges
 ```
 
-The small set of added capabilities is needed by Debian APT to run its package-download helper as `_apt`. They are not granted to ordinary non-root commands.
+The small set of added capabilities is needed by Debian APT to run its package-download helper as `_apt`. Every ordinary command drops its effective, inherited, and ambient capabilities before user-controlled shell code runs; the security suite checks that `CapEff` is zero and the dpkg database is not writable.
 
 Only the current project directory is mounted. The extension does not forward Pi session environment variables into the container.
 
@@ -83,11 +85,17 @@ Only Debian package-name syntax is accepted for `pkg_add`. npm, pip, cargo, URLs
 
 Container UID 0 is namespaced by `--userns=keep-id`; it is not host root.
 
+## Search
+
+Use the native `search` tool for source text lookup. It runs ripgrep inside the sandbox, confines the search root to the project, returns structured path/line matches, and caps both result count and captured output. The legacy `grep` tool is hidden. Using `grep`, `rg`, or similar text-search commands through `bash` is discouraged; it bypasses the native result bounds and structured match format.
+
+The tool accepts a regular expression by default, with optional literal matching, case-insensitive matching, file glob, project-relative path, and result limit. If results are truncated, narrow the path or glob.
+
 ## Path handling
 
 File paths are resolved with `realpath` before access. Existing paths must resolve below the project root. New files are checked by resolving their parent directory, which prevents ordinary `..` and symlink escapes.
 
-The file tools currently use Pi's host-side filesystem APIs with these project-boundary checks. Bash and `find` execute in the container. Pi's built-in grep implementation performs its traversal internally, so its traversal is not fully containerized yet; its file-read callbacks remain guarded.
+The file tools currently use Pi's host-side filesystem APIs with these project-boundary checks. Bash and `find` execute in the container. The model-facing grep traversal is disabled in favor of the container-backed `search` tool; host-side file callbacks remain guarded.
 
 ## User-controlled sandbox maintenance
 
@@ -114,14 +122,31 @@ This extension is a local development boundary, not a complete security sandbox:
 - `realpath` checks reduce symlink and traversal escapes but do not eliminate every possible time-of-check/time-of-use race.
 - Other Pi extensions continue to run in the Pi agent process unless they implement their own sandboxing.
 
-For stronger isolation, restrict container networking and replace the built-in grep/file implementations with fully container-backed custom tools.
+For stronger isolation, move the remaining host-side file operations into the container and restrict container networking.
 
 ## POC test
 
-The user-namespace and privilege behavior can be tested with:
+For the full extension startup and command path, run the headless RPC integration test:
+
+```bash
+./poc/test-podman-sandbox-rpc.py
+```
+
+It starts Pi with only this extension loaded, checks that `/sandbox` is registered, invokes `/sandbox list` through the RPC prompt command, and waits for the extension's completion notification. No LLM provider is needed. By default, the extension builds its embedded image; pass `--image <local-image>` to test with an existing image instead. The per-operation timeout defaults to 240 seconds and can be changed with `--timeout <seconds>`. On failure, Pi stderr is retained under `scratch/`. Add `--verbose` to print JSONL RPC records, Pi diagnostics, per-test progress, and extension startup/execution milestones. The extension also accepts `--sandbox-verbose` or Pi's `--verbose` when run directly.
+
+For security-boundary coverage, run the registered tools against disposable host and container fixtures:
+
+```bash
+./poc/test-podman-sandbox-rpc.py --security --image debian:stable-slim
+```
+
+The security suite exercises the registered tools against disposable host and container fixtures. It tests absolute and traversal paths, symlink and parent-symlink escapes, hard links, a deterministic validation-to-write race, outside canary disclosure through tool results/RPC/stderr, unchanged host-file snapshots after mutation attempts, container identity and project ownership, capability dropping, dpkg protection, package-input validation, and bounded structured search. A controlled host TCP receiver also reports whether mounted project data can egress; network access is currently allowed by policy, so that result is an audit observation rather than a failure. Hard-link and race probes are expected to fail until the host-file boundary is made resistant to those attacks. The suite does not need an LLM provider. Omit `--image` to cover the embedded-image build path as well.
+
+The user-namespace and privilege behavior can be tested separately with:
 
 ```bash
 ./poc/podman-sandbox-userns.sh
+./poc/podman-sandbox-userns.sh --verbose
 ```
 
 The POC verifies that:
