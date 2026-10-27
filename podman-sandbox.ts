@@ -495,7 +495,7 @@ export default function (pi: ExtensionAPI) {
         refresh: { command: "apt-get update", user: "0" },
         upgrade: { command: "apt-get update && apt-get upgrade -y", user: "0" },
         add: { command: `apt-get update && apt-get install --no-remove -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`, user: "0" },
-        remove: { command: `apt-get remove -y ${quoted} && (grep -vxF ${quoted} /tmp/pi-sandbox-explicit-packages > /tmp/pi-sandbox-explicit-packages.new 2>/dev/null || true) && (test -f /tmp/pi-sandbox-explicit-packages.new && mv /tmp/pi-sandbox-explicit-packages.new /tmp/pi-sandbox-explicit-packages || true)`, user: "0" },
+        remove: { command: `apt-get purge -y ${quoted} && apt-get autoremove --purge -y && (grep -vxF ${quoted} /tmp/pi-sandbox-explicit-packages > /tmp/pi-sandbox-explicit-packages.new 2>/dev/null || true) && (test -f /tmp/pi-sandbox-explicit-packages.new && mv /tmp/pi-sandbox-explicit-packages.new /tmp/pi-sandbox-explicit-packages || true)`, user: "0" },
       };
       const selected = commands[operation];
       if (!selected) {

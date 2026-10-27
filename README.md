@@ -109,7 +109,7 @@ LLM tools cannot remove packages or upgrade the sandbox. Those operations are av
 /sandbox remove <debian-package>
 ```
 
-`refresh` runs `apt-get update`, `upgrade` runs `apt-get update && apt-get upgrade -y`, and `remove` runs APT removal as container root. `/sandbox add` is equivalent to `pkg_add` and records the package in the sandbox-owned list. Invalid package names and unknown operations are rejected by the command handler.
+`refresh` runs `apt-get update`, `upgrade` runs `apt-get update && apt-get upgrade -y`, and `remove` runs `apt-get purge -y <package> && apt-get autoremove --purge -y` as container root. This purges the selected package and its configuration, then purges automatic dependencies that are no longer needed. `/sandbox add` is equivalent to `pkg_add` and records the package in the sandbox-owned list. Invalid package names and unknown operations are rejected by the command handler.
 
 
 This extension is a local development boundary, not a complete security sandbox:
