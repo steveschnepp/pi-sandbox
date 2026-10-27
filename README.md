@@ -157,3 +157,7 @@ The POC verifies that:
 - packages installed as root are visible to subsequent non-root commands.
 
 Scratch output is written below `scratch/`, whose local `.gitignore` contains `*`.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
