@@ -99,7 +99,32 @@ try {
   assert.equal(records[4].host, "blocked.example");
   assert.equal(records[4].allowed, false);
 
-  console.log("proxy allowlist, authentication, port policy, CONNECT rejection, and audit PoC passed");
+  const approvalAllowlist = new Set();
+  const approvalRequests = [];
+  const approvalProxy = await startManagedEgressProxy(approvalAllowlist, `approval-poc-${process.pid}`, async (hostname, port) => {
+    approvalRequests.push({ hostname, port });
+    if (hostname !== "approved.invalid") return false;
+    approvalAllowlist.add(hostname);
+    return true;
+  });
+  try {
+    const canceled = await httpProbe(approvalProxy.port, approvalProxy.token, "http://canceled.invalid/");
+    assert.equal(canceled.status, 403, "canceled approval must remain denied");
+
+    const approved = await httpProbe(approvalProxy.port, approvalProxy.token, "http://approved.invalid/");
+    assert.equal(approved.status, 502, "approval should pass the allowlist gate and proceed to DNS resolution");
+    assert.match(approved.body, /destination DNS lookup failed:/);
+    assert(approvalAllowlist.has("approved.invalid"), "approval callback must add the normalized hostname");
+    assert.deepEqual(approvalRequests, [
+      { hostname: "canceled.invalid", port: 80 },
+      { hostname: "approved.invalid", port: 80 },
+    ]);
+  } finally {
+    await approvalProxy.close();
+    await fs.rm(approvalProxy.auditLogPath, { force: true });
+  }
+
+  console.log("proxy allowlist, approval callback, authentication, port policy, CONNECT rejection, and audit PoC passed");
 } finally {
   await proxy.close();
   await fs.rm(proxy.auditLogPath, { force: true });

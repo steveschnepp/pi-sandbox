@@ -99,6 +99,12 @@ function parseAuthority(authority: string, defaultPort: number): { hostname: str
   return { hostname: normalizeHostname(parsed.hostname), port: Number(parsed.port || defaultPort) };
 }
 
+function rejectedStatus(message: string): number {
+  if (message === "proxy authentication required") return 407;
+  if (message.startsWith("destination DNS lookup failed:") || message === "destination did not resolve to a public address") return 502;
+  return 403;
+}
+
 function isAuthorized(request: IncomingMessage, token: string): boolean {
   const supplied = request.headers["proxy-authorization"];
   if (typeof supplied !== "string") return false;
@@ -117,10 +123,23 @@ function cleanRequestHeaders(headers: IncomingMessage["headers"], host: string):
   return result;
 }
 
-async function resolveDestination(hostname: string, port: number, allowlist: Set<string>): Promise<Destination> {
-  if (!allowlist.has(hostname)) throw new Error("destination hostname is not allowlisted");
+async function resolveDestination(
+  hostname: string,
+  port: number,
+  allowlist: Set<string>,
+  onDenied?: (hostname: string, port: number) => Promise<boolean>,
+): Promise<Destination> {
   if (port !== 80 && port !== 443) throw new Error("proxy permits only ports 80 and 443");
-  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  if (!allowlist.has(hostname)) {
+    const approved = await onDenied?.(hostname, port);
+    if (!approved || !allowlist.has(hostname)) throw new Error("destination hostname is not allowlisted");
+  }
+  let addresses: ResolvedAddress[];
+  try {
+    addresses = await lookup(hostname, { all: true, verbatim: true });
+  } catch (error) {
+    throw new Error(`destination DNS lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const address = addresses.find((candidate) => isPublicAddress(candidate.address));
   if (!address) throw new Error("destination did not resolve to a public address");
   return { hostname, port, address };
@@ -132,7 +151,11 @@ function requestHost(destination: Destination): string {
     : `${destination.hostname}:${destination.port}`;
 }
 
-export async function startManagedEgressProxy(allowlist: Set<string>, sessionId: string): Promise<ManagedEgressProxy> {
+export async function startManagedEgressProxy(
+  allowlist: Set<string>,
+  sessionId: string,
+  onDenied?: (hostname: string, port: number) => Promise<boolean>,
+): Promise<ManagedEgressProxy> {
   const token = crypto.randomBytes(24).toString("hex");
   const auditLogPath = path.join(os.tmpdir(), `session-${sessionId}-egress-${crypto.randomUUID()}.jsonl`);
   await fs.writeFile(auditLogPath, "", { flag: "wx", mode: 0o600 });
@@ -174,7 +197,7 @@ export async function startManagedEgressProxy(allowlist: Set<string>, sessionId:
         requestedHost = hostname;
         requestedPort = port;
         if (port !== 80) throw new Error("plain HTTP is permitted only on port 80");
-        destination = await resolveDestination(hostname, port, allowlist);
+        destination = await resolveDestination(hostname, port, allowlist, onDenied);
         const upstream = httpRequest({
           hostname: destination.address.address,
           family: destination.address.family,
@@ -198,7 +221,7 @@ export async function startManagedEgressProxy(allowlist: Set<string>, sessionId:
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         finishAudit({ allowed: false, reason: message });
-        rejectHttp(response, message === "proxy authentication required" ? 407 : 403, message);
+        rejectHttp(response, rejectedStatus(message), message);
       }
     })();
   });
@@ -223,7 +246,7 @@ export async function startManagedEgressProxy(allowlist: Set<string>, sessionId:
         requestedHost = target.hostname;
         requestedPort = target.port;
         if (target.port !== 443) throw new Error("CONNECT is permitted only on port 443");
-        destination = await resolveDestination(target.hostname, target.port, allowlist);
+        destination = await resolveDestination(target.hostname, target.port, allowlist, onDenied);
         upstream = connect({ host: destination.address.address, family: destination.address.family, port: destination.port });
         sockets.add(upstream);
         upstream.once("close", () => sockets.delete(upstream!));
@@ -244,7 +267,9 @@ export async function startManagedEgressProxy(allowlist: Set<string>, sessionId:
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         finishAudit(message);
-        if (!client.destroyed) client.end(`${message === "proxy authentication required" ? "HTTP/1.1 407 Proxy Authentication Required" : "HTTP/1.1 403 Forbidden"}\r\nConnection: close\r\n\r\n`);
+        const status = rejectedStatus(message);
+        const statusLine = status === 407 ? "407 Proxy Authentication Required" : status === 502 ? "502 Bad Gateway" : "403 Forbidden";
+        if (!client.destroyed) client.end(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`);
       }
     })();
   });

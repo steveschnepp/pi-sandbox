@@ -1046,3 +1046,376 @@ Committed the retained SUID and egress PoCs, their reproduction documentation, t
 ### Next Steps
 
 - No further POC organization work is required from this handoff. Future work can extend the retained experiments or address the separately documented security boundary questions.
+
+## Session 45: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Resolved the retained-output access issue by moving Bash stdout/stderr capture files from host `/tmp` into the project-local `.out/` directory. The extension prepares `.out/` before each Bash command, rejects a symlink/non-directory at that path, and creates `.out/.gitignore` with `*` if the ignore file does not already exist. Large output markers now name paths the project `read` tool can open; small/empty stream files are still deleted after inlining.
+
+Created the current project's `.out/.gitignore` with exactly `*` plus a newline. Git confirms the ignore file and generated descendants are ignored. It remains untracked/uncommitted as requested. Updated README guidance and expanded the RPC security adapter to check `.out` placement, the ignore rule, and reading retained stdout/stderr through Pi's `read` tool.
+
+### What We Learned
+
+- A host-only `/tmp` capture path is not reachable through the sandbox's project-confined `read` callback or from inside the container. Moving retained captures below the mounted project root makes both access paths work while preserving the normal project path guard.
+- Keeping the files in a dedicated ignored directory gives the desired retention and avoids adding generated logs to version control. Because `.out/` is mounted read-write, sandbox commands can also inspect these files; this is an intentional consequence of making them project-local.
+
+### What We Decided
+
+- Store full Bash captures in `<project>/.out/`, use mode-0600 files, and ensure the directory has a local `.gitignore` containing `*` when the file is absent.
+- Do not commit `.out/.gitignore` or generated output files. Leave the current project's ignored `.out/` artifacts local.
+- Retain the existing 128-line preview, small-file cleanup, and stdout/stderr separation.
+
+### What We'd Do Differently
+
+- The original host `/tmp` design should have been tested through the actual Pi `read` operation, not only by reading the files from the host-side integration harness.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Stores captured streams in a guarded, project-local `.out/` directory and creates its ignore file if absent. |
+| `README.md` | Documents `.out/` retention, Pi `read` access, ignore behavior, and project-mount visibility. |
+| `poc/podman-sandbox-security-test.ts` | Verifies ignore-file contents, `.out/` paths, full host contents, and `read` access to retained output. |
+| `.out/.gitignore` | Local wildcard ignore rule; intentionally ignored and not committed. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this issue and resolution. |
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 120`: passed, 39 checks, zero failures or skips. In particular, retained 4,530-line stdout and stderr files were readable through the production Pi `read` tool, while outside-project and host-`/tmp` reads remained blocked.
+- `pi -ne -e ./podman-sandbox.ts -e ./poc/podman-sandbox-security-test.ts --help`: passed.
+- `git diff --check`: passed before the final local naming cleanup.
+- `.out/.gitignore` contains `*` and `git check-ignore` confirms it and generated log paths are ignored.
+
+### Next Steps
+
+- No commit was requested. Keep the code/documentation/test changes in the worktree and keep `.out/.gitignore` local and ignored.
+
+## Session 46: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Added user-controlled `/sandbox reset`. It waits for any in-progress container startup, force-removes the current session container with `podman rm -f`, and clears the running-state flag so the next sandbox command starts a fresh container. The image is deliberately retained. `ensureImage()` continues to reuse the existing local tag; when a tag is missing, Podman builds using its normal layer cache rather than a forced no-cache rebuild. The RPC smoke harness now exercises list -> reset -> list -> reset, verifies a fresh container can start from the retained image, and leaves the smoke-test container removed.
+
+Updated README usage and lifecycle documentation. The first smoke attempt used `debian:stable-slim` as a custom image, which does not contain `nft`; startup correctly failed while installing the sandbox egress policy. Re-ran against the existing embedded sandbox image. The smoke test initially left its final container running because it ended after the recreate step, so the harness now performs a final reset; verified no running containers remained afterward.
+
+### What We Learned
+
+- `podman rm -f` removes the container, not its image. The next sandbox operation reuses the image and only creates a new container; installed packages and other writable-layer state in the removed container are lost.
+- Custom images must contain the extension's runtime dependencies, including `nft`; Debian stable slim by itself is not a valid image for this sandbox configuration.
+- Making the smoke harness reset its final container gives a deterministic cleanup result rather than relying only on process shutdown hooks.
+
+### What We Decided
+
+- `/sandbox reset` is user-only and removes the current session container without invoking image removal or rebuild.
+- Keep the current image if present. If absent, build with Podman's default layer cache; do not add `--no-cache`.
+- Test reset followed by a fresh `/sandbox list`, then reset once more to leave the test environment clean.
+- No commit was requested for this work; leave changes in the worktree.
+
+### What We'd Do Differently
+
+- Use the extension's embedded image, or a documented compatible custom image, for RPC smoke tests instead of assuming `debian:stable-slim` includes the sandbox's firewall utilities.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Adds synchronized container reset behavior and registers `/sandbox reset`, retaining the image. |
+| `README.md` | Documents image reuse/cache behavior and reset effects. |
+| `poc/test-podman-sandbox-rpc.py` | Exercises reset, fresh-container startup, and final test cleanup. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this reset and image-reuse session. |
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --verbose --timeout 60`: passed. It confirmed the local image was available before each container start, reset removed the container, the subsequent sandbox list succeeded in a fresh container, and the final reset completed.
+- `python3 -B` AST parse of the RPC runner: passed.
+- `pi -ne -e ./podman-sandbox.ts --help`: passed.
+- `git diff --check`: passed.
+- `podman ps`: no running containers remained after the successful final-reset smoke test.
+
+### Next Steps
+
+- Review the final worktree diff and keep it uncommitted unless asked otherwise. The local `.out/.gitignore` remains ignored and must not be committed.
+
+## Session 47: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Reproduced the model-facing `sandbox.pkg_add` failure (`setpriv: apply bounding set: Operation not permitted`). Package operations use `setpriv --bounding-set=-net_admin` so APT cannot modify the egress firewall, but the container capability set did not include `SETPCAP`, which `setpriv` needs to drop a capability from the bounding set. Added `--cap-add=SETPCAP` to the container startup capability set and documented the reason. Added an integration regression that invokes `sandbox.pkg_add` for `curl` and verifies `curl --version` afterward.
+
+### What We Learned
+
+- `setpriv --bounding-set=-net_admin` requires `CAP_SETPCAP`; granting APT's other capabilities alone is insufficient.
+- The capability posture is set when the Podman container is created. An already-running container will not gain `SETPCAP` from an extension source reload; it must be recreated.
+
+### What We Decided
+
+- Retain `NET_ADMIN` only for firewall setup and allow the package helper to remove it from its bounding set using `SETPCAP` before launching APT.
+- Keep ordinary Bash capability assertions in the security suite to guard against leaking the added container capability to the mapped user.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Adds `SETPCAP` to the container capability set used by the restricted package helper. |
+| `README.md` | Documents the `SETPCAP` requirement and its firewall-boundary role. |
+| `poc/podman-sandbox-security-test.ts` | Adds a `sandbox.pkg_add curl` regression and verifies the package is usable. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the failure cause and fix. |
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 40/40 checks, including installing `curl` through the production `sandbox.pkg_add` callback and running `curl --version` afterward.
+- `git diff --check` and mission-log lint: passed at the completion checkpoint.
+
+### Next Steps
+
+- Recreate any already-running sandbox container before retrying `sandbox.pkg_add`; the running container cannot acquire the new capability retroactively.
+- Continue the separate base-image/derived-APT-layer design so Bash cannot persist filesystem changes outside the project mount.
+
+## Session 48: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Implemented the agreed base-plus-derived-APT-layer design. The immutable base image remains shared; each project keeps an explicit package manifest in the host cache outside the mounted workdir and builds a project-tagged derived image by passing the complete sorted package list to one `apt-get install --no-remove` step. `/sandbox add`, `/sandbox remove`, `sandbox.pkg_add`, `/sandbox refresh`, `/sandbox upgrade`, and `/sandbox reset` now update/rebuild those image layers instead of mutating package state through Bash. Reset removes this project's session container and all its derived APT/upgrade tags, then rebuilds from the retained base and manifest using Podman's normal cache. It does not call global `podman system reset` or remove the base image.
+
+Started the session container with `--read-only`, the project as the only persistent writable mount, and ephemeral `/tmp`, `/var/tmp`, and `/run` tmpfs mounts. Container names now include the sanitized project basename and path hash while retaining a per-session suffix. Package manifests are atomically replaced, but no cross-process lock was added per the user's accepted best-effort concurrency policy. Removed the experimental `APT_REFRESH_GENERATION` cache-buster; normal image tags derive from base/package state, and explicit refresh/upgrade use `--no-cache` on their derived APT layers only.
+
+The initial security rerun caught a refactor typo (`proxyEnvironment` was missing in `exec`); corrected it and reran the full suite successfully. The package-install failure is now avoided structurally: APT runs in Podman image builds with the full package list, not through `setpriv --bounding-set=-net_admin` in the session container. The earlier `SETPCAP` fix is no longer needed by the runtime package path and was removed from container capabilities.
+
+### What We Learned
+
+- Read-only rootfs plus a writable project bind and temporary tmpfs mounts lets Bash edit project files without persisting changes elsewhere in the container image.
+- Passing the full explicit package manifest to APT makes each derived image reproducible and allows APT to resolve dependencies and newer candidates; resetting a derived tag does not remove the base image or Podman's build cache.
+- The `setpriv` failure was caused by runtime APT capability handling. Moving APT into a constrained image-build path removes that package-helper bounding-set operation entirely.
+- A single-threaded event loop does not create simultaneous JS memory accesses, but asynchronous operations can interleave across `await`; per user decision, no lock is added and cross-process package-list updates remain best effort.
+
+### What We Decided
+
+- Keep the base image immutable and shared; keep explicit APT packages in a project-specific derived layer.
+- Keep the package manifest outside the project mount so Bash cannot edit package state. Bash may persist only through the workdir mount; scratch tmpfs writes disappear with the container.
+- Keep `/sandbox reset` project-scoped: remove project-derived layers and the session container, preserve the base, rebuild from the complete manifest, and never reset unrelated Podman storage.
+- Avoid synthetic generation tokens and cross-process locking. Use the full package list for image builds and bypass only derived-layer cache for explicit refresh/upgrade operations.
+- Do not commit `.out/.gitignore` or any `.out/` output. No commit was requested for this work.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Base/derived image builds, per-project host manifest, package commands, scoped reset, project-labeled containers, and read-only Bash rootfs. |
+| `README.md` | Documents image layers, package state, reset scope, package-build networking, and read-only Bash boundary. |
+| `poc/podman-sandbox-security-test.ts` | Verifies `.out` reads, read-only rootfs, and real `sandbox.pkg_add curl` behavior. |
+| `poc/test-podman-sandbox-rpc.py` | Isolates package state/images during security tests and verifies package-list survival across reset. |
+| `specs/README.md` | Adds the architecture spec index. |
+| `specs/01_SANDBOX_IMAGE_LAYERS.md` | Specifies the base/derived image and Bash filesystem model. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended the implementation record. |
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 41/41 checks. This includes a derived `curl` image install, `curl --version` inside the read-only container, project writes, rootfs read-only/tmpfs checks, and direct-egress/path-boundary tests.
+- The security RPC flow then ran `/sandbox reset`, confirmed `curl` remained in the complete project package list, started a fresh container, and reset again for cleanup.
+- `./poc/test-podman-sandbox-rpc.py --verbose --timeout 60`: passed list -> reset -> fresh list -> final reset using the cached base image.
+- `pi -ne -e ./podman-sandbox.ts -e ./poc/podman-sandbox-security-test.ts --help`: passed.
+- RPC runner Python AST parse, `git diff --check`, and mission-log lint: passed.
+- `podman ps`: no running containers remained after both harness runs. Test-only derived images and package manifests were cleaned by the runner.
+- `.out/.gitignore` still contains `*`, is ignored, and remains uncommitted.
+
+### Next Steps
+
+- Review the current worktree diff; leave it uncommitted unless asked. Keep the local `.out/.gitignore` and generated captures ignored.
+
+## Session 49: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Changed the sandbox output firewall's terminal behavior from silent drop to explicit REJECT. The OUTPUT chain still defaults to drop as a fail-closed fallback, but after the allow rules it now rejects other traffic with `icmpx type admin-prohibited`. This makes TCP connect attempts return an error promptly instead of waiting for a timeout. Updated the rootless nftables PoC to install the same rule and assert that its direct-connect negative control completes before the timeout; updated the main security test to enforce a bounded rejection time.
+
+### What We Learned
+
+- In the current rootless Podman/Netavark/Pasta setup, the explicit reject made the denied `/dev/tcp` attempt return `No route to host` in about 1.02 seconds, while the host listener received no connection.
+- The default-drop chain policy remains useful as a fail-closed fallback; a final explicit REJECT rule supplies fast errors for traffic that reaches the end of the OUTPUT chain.
+
+### What We Decided
+
+- Use an explicit nftables reject rule after the loopback, established, package-identity, and proxy-endpoint accepts.
+- Test both the absence of a connection at the host receiver and prompt failure at the calling command; a nonzero exit after a long timeout is not sufficient.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Adds the final `reject with icmpx type admin-prohibited` firewall rule. |
+| `poc/podman-sandbox-security-test.ts` | Asserts direct mapped-user egress fails before a 5-second bound. |
+| `poc/test_egress/egress-netfilter-poc.py` | Mirrors the reject rule and asserts failure precedes the three-second timeout. |
+| `README.md` | Documents fast REJECT behavior rather than silent drops. |
+| `poc/test_egress/README.md` | Describes and records the prompt-rejection observation. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this network behavior correction. |
+
+### Test Results / Benchmarks
+
+- `python3 -B poc/test_egress/egress-netfilter-poc.py localhost/pi-sandbox:f716bddb4c529df6`: passed; allowed proxy, root, and UID 42 receivers received expected messages, direct receiver received none, and the mapped-user rejection completed in about 1.02 seconds.
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 41/41 checks, including prompt direct-egress rejection.
+- `git diff --check`: passed before this log append.
+
+### Next Steps
+
+- Keep all changes in the current uncommitted worktree; do not commit `.out/.gitignore` or generated `.out/` logs.
+
+## Session 50: Podman Sandbox Extension (2026-10-27)
+
+### What We Learned
+
+A later `podman ps` check found a live project-labeled sandbox container owned by the active Pi process (PID 876), using the project's derived `curl` image. It is not one of the RPC harness's random package-layer fixtures. Left it untouched rather than removing a container that may belong to the user's live Pi session. The active container predates the final REJECT rule; nftables policy is installed at container startup, so the running session needs a reset/restart before it receives that rule.
+
+### What We Decided
+
+- Do not remove the active Pi session's container as test cleanup. Keep harness cleanup limited to containers whose PID belongs to the test's own Pi child.
+- Ask the user to restart/recreate the live sandbox container to apply the updated REJECT rule; the source change applies to newly initialized containers.
+
+### Test Results / Benchmarks
+
+- Final worktree verification passed `git diff --check`, mission-log lint, and extension help loading.
+- `.out/.gitignore` remains ignored with the exact `*` rule and was not committed.
+
+### Next Steps
+
+- The user should restart Pi or run `/sandbox reset` in the newly loaded extension to install the REJECT rule into the active project container.
+
+## Session 51: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Continued the sandbox image and egress work. The project now has an immutable base image, a per-project derived APT image built from the complete explicit package list, a host-side package manifest not mounted into the container, and a read-only Bash rootfs with only the project mount persistent. The runtime nftables chain now has an explicit final REJECT rule so direct egress attempts fail promptly. The focused egress PoC measured a rejection in about 1.02 seconds, and the RPC security suite passed 41/41 checks including package installation, package-list survival across reset, read-only rootfs, and prompt egress rejection.
+
+The user tested `curl -sS https://ifconfig.io` with the default empty allowlist and received HTTP 403 on CONNECT, which is the expected policy result. The user asked whether the extension could propose adding a rejected hostname and suggested session-scoped persistence in the Pi session JSONL. Read Pi extension, terminal UI, RPC Extension UI, session-format, and SDK references for confirmations and session custom entries. No runtime host-allowlist proposal was implemented in this step.
+
+### What We Learned
+
+- The current proxy returns 403 for an unallowlisted CONNECT hostname; this differs from the nftables direct-egress REJECT, which now fails promptly.
+- `ctx.ui.confirm()` is available in TUI and RPC modes; JSON/print modes lack interactive UI. Session custom entries via `pi.appendEntry()` do not enter model context and can be restored from `ctx.sessionManager.getBranch()` on session start.
+- A session-scoped approval should never silently broaden the allowlist. The extension should show the denied hostname/port, ask for explicit approval, validate and normalize the hostname, update the live session allowlist only after approval, and persist approval as branch-aware session state if approved.
+
+### What We Decided
+
+- Keep allowlist additions session-scoped; do not write them into global settings or the project package manifest.
+- Continue to distinguish direct network REJECTs from proxy HTTP 403 policy responses in tests and user-facing explanations.
+- Do not touch the live PID 876 sandbox container during this work. It was created before the final firewall REJECT rule and needs a Pi restart or `/sandbox reset` from the newly loaded extension to receive the new policy.
+- Leave all code/spec changes uncommitted. Keep `.out/.gitignore` with its `*` rule ignored and uncommitted.
+
+### What We'd Do Differently
+
+- Add a deterministic proxy-denial test that exercises the user-approval flow without making a public network request, and test persistence by branching/resuming a session before exposing the feature broadly.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Base/derived image layer, project package manifest, read-only Bash container, project-labeled container, and fast nftables REJECT behavior. |
+| `README.md` | Documents layered package state, scoped reset, read-only rootfs, and prompt egress rejection. |
+| `poc/podman-sandbox-security-test.ts` | Package-layer, read-only rootfs, `.out` readback, and prompt-reject regressions. |
+| `poc/test-podman-sandbox-rpc.py` | Isolated package-state tests and reset/rebuild smoke coverage. |
+| `poc/test_egress/egress-netfilter-poc.py` | Checks the REJECT rule and prompt failure behavior. |
+| `poc/test_egress/README.md` | Documents expected prompt REJECT semantics. |
+| `specs/01_SANDBOX_IMAGE_LAYERS.md` | Specifies base/derived images and Bash write boundaries. |
+| `specs/README.md` | Indexes the new image-layer spec. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this continuation handoff. |
+
+### Test Results / Benchmarks
+
+- `python3 -B poc/test_egress/egress-netfilter-poc.py localhost/pi-sandbox:f716bddb4c529df6`: passed; mapped-user direct egress was rejected in about 1.02 seconds.
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 41/41 checks.
+- `./poc/test-podman-sandbox-rpc.py --verbose --timeout 60`: passed list/reset/rebuild/list/final-reset sequence.
+- `git diff --check`, extension loader help, and mission-log lint: passed.
+- The current tree remains uncommitted; unrelated `Makefile`, `fibo.c`, and `test_fibo.sh` remain untouched.
+
+### Next Steps
+
+- Implement an explicit, mode-aware prompt when an authenticated proxy request is rejected for an unallowlisted DNS hostname.
+- On approval only, add that validated hostname to the current session's mutable allowlist and append a custom session entry; restore approved hosts from the active branch on resume.
+- Add focused tests for deny, cancel, approve, normalization, allowed retry, session restore, and branch-local behavior. Do not auto-allow or persist approvals outside session JSONL.
+
+## Session 52: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Implemented session-scoped approval for denied proxy destinations. When an authenticated HTTP or HTTPS proxy request names a valid but unlisted DNS hostname on an allowed port, the managed proxy calls the extension approval callback. Pi now asks the user to allow that exact hostname; approval adds it to the live exact-host allowlist and writes a non-model-visible `sandbox-egress-allow` custom entry. The prompt explains that approval is branch-scoped, applies only to ports 80/443, and does not weaken public-address validation. Rejected/canceled requests remain denied, and requests in non-interactive modes remain denied without a prompt.
+
+On every session start, the extension rebuilds the effective allowlist from the configured CLI list plus valid approvals in `sessionManager.getBranch()`. This avoids carrying an approval into a branch that does not contain its custom entry. Concurrent requests for one hostname share one pending confirmation. DNS failures after approval now return HTTP 502 rather than misreporting a policy denial as 403.
+
+Added deterministic callback tests to `poc/test_egress/egress-proxy-test.mjs` and extended the RPC security adapter to simulate denial and approval, inspect the prompt and branch entry, replay session startup, and verify the restored host is not prompted again. Updated the README's egress-policy description. Kept the pre-existing live Pi sandbox container untouched; the security runner cleaned up its own isolated container and package/image state.
+
+### What We Learned
+
+- Proxy requests can wait on an async user decision before DNS resolution; after confirmation, the original request can continue rather than requiring a command retry.
+- Pi custom entries do not enter model context and `getBranch()` supplies the active ancestry, which provides the intended branch-local persistence boundary.
+- Session startup must reset the mutable set before replaying branch entries, otherwise approvals from a previous branch could leak across navigation.
+- An approval can succeed while DNS still fails; distinguish this upstream resolution failure (502) from an allowlist-policy denial (403).
+
+### What We Decided
+
+- Approve exact normalized hostnames only, never wildcard suffixes or arbitrary ports. The proxy continues to permit only HTTP/80 and HTTPS CONNECT/443 and validates each resolution as public.
+- Persist user approval only in the active Pi session branch; do not modify CLI flags, global settings, or project package state.
+- Fail closed if no interactive UI is available or the user declines.
+
+### What We'd Do Differently
+
+- Add a dedicated branch-navigation integration test that forks before an approval and proves the approval is absent there. The current security test verifies persistence and restoration on the active branch and the implementation restores from branch ancestry, but does not navigate between two branches.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `egress-proxy.ts` | Waits for approval of unlisted hostnames and classifies DNS failures as 502. |
+| `podman-sandbox.ts` | Prompts for exact-host approval, writes branch-local custom entries, restores approvals from active branch history, and deduplicates concurrent prompts. |
+| `poc/test_egress/egress-proxy-test.mjs` | Covers denied and approved callback paths without external network access. |
+| `poc/podman-sandbox-security-test.ts` | Verifies prompt details, deny/approve persistence, and session-start restoration through production callbacks. |
+| `README.md` | Documents interactive, branch-scoped allowlist approvals and non-interactive deny behavior. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appends this session record. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed allowlist normalization, cancellation, approval-to-DNS progression, authentication, port policy, CONNECT rejection, and audit checks.
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 42/42 checks. The new checks validated deny-without-persistence, exact hostname/port prompt content, approval persistence, and approval restoration without another prompt.
+- `pi -ne -e ./podman-sandbox.ts -e ./poc/podman-sandbox-security-test.ts --help`: passed.
+- RPC-runner Python AST parse and `git diff --check`: passed.
+- Confirmed rootless Podman remained true and the pre-existing live container was still running; the test runner cleaned only its own container/resources.
+
+### Next Steps
+
+- Add the branch-navigation test if session-approval branching becomes a release acceptance requirement.
+- Keep user approvals confined to the active branch; do not promote them into the project or global allowlist automatically.
+
+## Session 53: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Branch Navigation Hardening
+
+Followed up on the branch-scoped allowlist implementation after noticing that `session_start` alone is not sufficient: Pi can navigate to another branch within the same session. Added a `session_tree` handler that rebuilds the mutable allowlist from the configured CLI hosts and the newly active branch's custom approval entries. Approval also records the leaf ID before showing confirmation and refuses to persist if the active leaf changed while the prompt was open.
+
+Extended the provider-free security adapter to simulate a tree switch to a branch without the approved custom entry. It verifies that the previously approved hostname prompts and remains denied there, then restores the approved branch and verifies that the hostname is usable again without another prompt. This is a deterministic branch-boundary check without changing the user's live Pi session.
+
+### What We Learned
+
+- Branch-local policy must be refreshed on both session lifecycle transitions and in-session tree navigation; otherwise an in-memory Set can outlive the branch that authorized it.
+- Rechecking the leaf after an asynchronous confirmation prevents an approval initiated on one branch from being appended after navigation to another.
+
+### What We Decided
+
+- Rebuild effective egress policy on `session_tree` as well as `session_start`.
+- Keep the existing live user container untouched; all validation used the isolated RPC runner's own test container and resources.
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 42/42 checks, including deny, approval persistence, session-start restoration, simulated branch revocation, and restoration of the approved branch.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed.
+- Extension loader help and `git diff --check`: passed.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Recomputes allowed hosts on branch-tree navigation and guards approval against leaf changes while awaiting UI. |
+| `poc/podman-sandbox-security-test.ts` | Checks that an approval is revoked on a branch without its custom entry and restored on return. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appends this branch-navigation correction. |
+
+### Next Steps
+
+- None for the allowlist fix; preserve the distinction between configured CLI hosts and session-branch approvals.

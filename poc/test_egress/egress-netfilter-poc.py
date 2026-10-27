@@ -66,9 +66,15 @@ gateway=$1
 /usr/sbin/nft add rule inet egress_test output meta skuid 0 accept
 /usr/sbin/nft add rule inet egress_test output meta skuid 42 accept
 /usr/sbin/nft add rule inet egress_test output ip daddr "$gateway" tcp dport {proxy_port} accept
+/usr/sbin/nft add rule inet egress_test output reject with icmpx type admin-prohibited
 setpriv --reuid={mapped_uid} -- bash -c 'printf proxy-user >/dev/tcp/'"$gateway"'/{proxy_port}'
-if timeout --kill-after=1 2 setpriv --reuid={mapped_uid} -- bash -c 'printf blocked-user >/dev/tcp/'"$gateway"'/{blocked_port}'; then
+start=$(date +%s%N)
+if timeout --kill-after=1 3 setpriv --reuid={mapped_uid} -- bash -c 'printf blocked-user >/dev/tcp/'"$gateway"'/{blocked_port}'; then
   echo "ERROR: mapped user bypassed the proxy-only rule" >&2; exit 21
+fi
+elapsed=$(( $(date +%s%N) - start ))
+if [ "$elapsed" -ge 3000000000 ]; then
+  echo "ERROR: direct egress was dropped until timeout instead of rejected" >&2; exit 23
 fi
 if setpriv --bounding-set=-net_admin --inh-caps=-all --ambient-caps=-all -- /usr/sbin/nft flush ruleset >/dev/null 2>&1; then
   echo "ERROR: package-style root process could modify the firewall" >&2; exit 22

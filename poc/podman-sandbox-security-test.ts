@@ -12,6 +12,10 @@ const tools = new Map<string, any>();
 // Lifecycle events are forwarded so the tested extension performs real startup
 // image validation/build and its normal container cleanup on RPC shutdown.
 const innerEvents = new Map<string, Function[]>();
+let approvalDecision = false;
+const approvalPrompts: { title: string; message: string }[] = [];
+let restartInnerSession: (() => Promise<void>) | undefined;
+let currentTestContext: any;
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -110,8 +114,8 @@ async function bash(command: string, cwd = process.cwd(), timeout = 20) {
 }
 
 export default function (pi: ExtensionAPI) {
-  // Only the lifecycle and registrations needed by production are bridged. The
-  // inner maintenance command is intentionally not exposed by the test shim.
+  // Lifecycle events and user-only maintenance commands are forwarded so the
+  // test harness can exercise real reset/package behavior through RPC.
   const bridge = {
     registerFlag: (name: string, options: any) => pi.registerFlag(name as any, options),
     getFlag: (name: string) => pi.getFlag(name as any),
@@ -121,7 +125,8 @@ export default function (pi: ExtensionAPI) {
       // verify real active/hidden exposure rather than metadata in isolation.
       pi.registerTool(definition);
     },
-    registerCommand: () => undefined,
+    registerCommand: (name: string, options: any) => pi.registerCommand(name as any, options),
+    appendEntry: (customType: string, data: unknown) => pi.appendEntry(customType, data),
     on: (event: string, handler: Function) => {
       const handlers = innerEvents.get(event) ?? [];
       handlers.push(handler);
@@ -131,7 +136,27 @@ export default function (pi: ExtensionAPI) {
   sandboxExtension(bridge as unknown as ExtensionAPI);
 
   pi.on("session_start", async (event, ctx) => {
-    for (const handler of innerEvents.get("session_start") ?? []) await handler(event, ctx);
+    const ui = new Proxy(ctx.ui, {
+      get(target, property, receiver) {
+        if (property === "confirm") return async (title: string, message: string) => {
+          approvalPrompts.push({ title, message });
+          return approvalDecision;
+        };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const testContext = new Proxy(ctx, {
+      get(target, property, receiver) {
+        if (property === "hasUI") return true;
+        if (property === "ui") return ui;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    restartInnerSession = async () => {
+      for (const handler of innerEvents.get("session_start") ?? []) await handler(event, testContext);
+    };
+    currentTestContext = testContext;
+    await restartInnerSession();
   });
   pi.on("session_shutdown", async () => {
     for (const handler of innerEvents.get("session_shutdown") ?? []) await handler();
@@ -320,10 +345,12 @@ export default function (pi: ExtensionAPI) {
           const result = await bash("date -u +%Y-%m-%d");
           assert(result.exit_code === 0 && /^\d{4}-\d{2}-\d{2}$/.test(result.output.trim()), `date failed: ${result.output}`);
         });
-        await record("bash inlines small streams and deletes their host files", async () => {
+        await record("bash inlines small streams and deletes their .out files", async () => {
           const sessionPrefix = `session-${String(ctx.sessionManager.getSessionId()).replace(/[^A-Za-z0-9_-]/g, "_")}-`;
-          const listFiles = async () => (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith(sessionPrefix)).sort();
+          const outputDir = path.join(process.cwd(), ".out");
+          const listFiles = async () => (await fs.readdir(outputDir)).filter((name) => name.startsWith(sessionPrefix)).sort();
           const before = await listFiles();
+          assert((await fs.readFile(path.join(outputDir, ".gitignore"), "utf8")) === "*\n", ".out/.gitignore did not ignore generated logs");
           const result = await bash("printf small-out; printf small-err >&2");
           const after = await listFiles();
           assert(result.exit_code === 0, `small-output command failed: ${result.formattedOutput}`);
@@ -334,7 +361,7 @@ export default function (pi: ExtensionAPI) {
           const result = await bash("true");
           assert(result.formattedOutput === "[exit code = 0]", `empty command returned unexpected output: ${result.formattedOutput}`);
         });
-        await record("bash previews 128 lines and saves complete stdout and stderr on the host", async () => {
+        await record("bash previews 128 lines and saves complete stdout and stderr in readable project .out files", async () => {
           const result = await tool("bash", {
             command: `i=1; while [ "$i" -le 4530 ]; do printf 'stdout-%s\\n' "$i"; printf 'stderr-%s\\n' "$i" >&2; i=$((i + 1)); done; exit 213`,
             timeout: 30,
@@ -344,6 +371,7 @@ export default function (pi: ExtensionAPI) {
           const stdoutMatch = summary.match(/^\[\.\.\. full 4530 lines output to (.+\.out)\]$/m);
           const stderrMatch = summary.match(/^\[\.\.\. full 4530 lines output to (.+\.err)\]$/m);
           assert(stdoutMatch && stderrMatch, `full-output markers missing: ${summary}`);
+          assert(path.dirname(stdoutMatch[1]) === path.join(process.cwd(), ".out") && path.dirname(stderrMatch[1]) === path.join(process.cwd(), ".out"), "full-output files were not written below project .out/");
           assert(summary.startsWith(`[stdout]\n${Array.from({ length: 128 }, (_, index) => `stdout-${index + 1}`).join("\n")}\n`), "stdout preview did not contain exactly the first 128 lines");
           assert(summary.includes(`[stderr]\n${Array.from({ length: 128 }, (_, index) => `stderr-${index + 1}`).join("\n")}\n`), "stderr preview did not contain exactly the first 128 lines");
           assert(!summary.includes("stdout-129") && !summary.includes("stderr-129"), "the preview included output beyond 128 lines");
@@ -352,6 +380,12 @@ export default function (pi: ExtensionAPI) {
             const [stdout, stderr] = await Promise.all([fs.readFile(stdoutMatch[1], "utf8"), fs.readFile(stderrMatch[1], "utf8")]);
             assert(stdout.startsWith("stdout-1\n") && stdout.endsWith("stdout-4530\n"), "stdout file did not contain the complete output");
             assert(stderr.startsWith("stderr-1\n") && stderr.endsWith("stderr-4530\n"), "stderr file did not contain the complete output");
+            const [readStdout, readStderr] = await Promise.all([
+              tool("read", { path: stdoutMatch[1], offset: 4530, limit: 1 }),
+              tool("read", { path: stderrMatch[1], offset: 4530, limit: 1 }),
+            ]);
+            assert(JSON.stringify(readStdout).includes("stdout-4530"), "Pi read tool could not open retained stdout output");
+            assert(JSON.stringify(readStderr).includes("stderr-4530"), "Pi read tool could not open retained stderr output");
           } finally {
             await Promise.all([fs.rm(stdoutMatch[1], { force: true }), fs.rm(stderrMatch[1], { force: true })]);
           }
@@ -395,7 +429,11 @@ export default function (pi: ExtensionAPI) {
           const stat = await fs.stat(insideFile);
           assert(stat.uid === (process.getuid?.() ?? 1000) && stat.gid === (process.getgid?.() ?? 1000), `wrong host ownership: ${stat.uid}:${stat.gid}`);
         });
-        await record("mapped-user direct TCP egress is blocked", async () => {
+        await record("Bash rootfs is read-only while project and temporary mounts remain writable", async () => {
+          const result = await bash("options=$(findmnt -n -o OPTIONS /); case \",$options,\" in *,ro,*) ;; *) exit 31;; esac; temp=/tmp/pi-sandbox-readonly-$$; printf ok > \"$temp\" && test \"$(cat \"$temp\")\" = ok && rm \"$temp\" && printf readonly");
+          assert(result.exit_code === 0 && result.output.trim() === "readonly", `read-only rootfs assertion failed: ${result.formattedOutput}`);
+        });
+        await record("mapped-user direct TCP egress is rejected promptly", async () => {
           const server = net.createServer();
           const connection = new Promise<void>((resolve) => server.once("connection", (socket) => {
             socket.destroy();
@@ -411,8 +449,11 @@ export default function (pi: ExtensionAPI) {
             });
             const address = server.address();
             assert(address && typeof address !== "string", "test receiver did not bind a TCP port");
-            const result = await bash(`timeout 3 bash -c 'printf bypass > /dev/tcp/host.containers.internal/${address.port}'`, process.cwd(), 8);
+            const startedAt = Date.now();
+            const result = await bash(`timeout 6 bash -c 'printf bypass > /dev/tcp/host.containers.internal/${address.port}'`, process.cwd(), 10);
+            const elapsedMs = Date.now() - startedAt;
             assert(result.exit_code !== 0, "mapped bash user reached a direct host TCP destination");
+            assert(elapsedMs < 5000, `direct egress was dropped until timeout instead of rejected (${elapsedMs}ms)`);
             const accepted = await Promise.race([
               connection.then(() => true),
               new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
@@ -422,10 +463,58 @@ export default function (pi: ExtensionAPI) {
             await new Promise<void>((resolve) => server.close(() => resolve()));
           }
         });
-        await record("bash can reach the monitored proxy but unallowlisted DNS names are denied", async () => {
+        await record("sandbox proxy asks before denying an unlisted DNS hostname", async () => {
           const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://unlisted.invalid/ HTTP/1.1\\r\\nHost: unlisted.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
           const result = await bash(command, process.cwd(), 10);
-          assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 403"), `proxy did not reject an unallowlisted DNS destination: ${result.formattedOutput}`);
+          assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 403"), `proxy did not deny the unlisted DNS destination: ${result.formattedOutput}`);
+          const prompt = approvalPrompts.at(-1);
+          assert(prompt?.title === "Allow sandbox network destination?" && prompt.message.includes("unlisted.invalid:80"), "unlisted destination did not trigger a clear user approval prompt");
+          assert(!ctx.sessionManager.getBranch().some((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "unlisted.invalid"), "denied hostname was persisted to the session branch");
+        });
+        await record("approved proxy hostname is persisted to the active session branch", async () => {
+          approvalDecision = true;
+          try {
+            const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
+            const result = await bash(command, process.cwd(), 10);
+            assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 502"), `approved hostname did not pass the allowlist gate to DNS resolution: ${result.formattedOutput}`);
+          } finally {
+            approvalDecision = false;
+          }
+          const prompt = approvalPrompts.at(-1);
+          assert(prompt?.message.includes("approved.invalid:80"), "approved destination prompt omitted hostname/port");
+          const approvals = ctx.sessionManager.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid");
+          assert(approvals.length === 1, `approval was not stored exactly once in the active session branch: ${approvals.length}`);
+          assert(restartInnerSession, "test adapter could not replay session startup");
+          const promptsBeforeRestore = approvalPrompts.length;
+          await restartInnerSession();
+          const retryCommand = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
+          const restored = await bash(retryCommand, process.cwd(), 10);
+          assert(restored.exit_code === 0 && restored.output.trim().startsWith("HTTP/1.1 502"), `restored hostname did not pass the allowlist gate: ${restored.formattedOutput}`);
+          assert(approvalPrompts.length === promptsBeforeRestore, "session startup did not restore the branch approval");
+
+          const alternateBranchManager = new Proxy(currentTestContext.sessionManager, {
+            get(target, property) {
+              if (property === "getBranch") return () => target.getBranch().filter((entry: any) => !(entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid"));
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+          const alternateBranchContext = new Proxy(currentTestContext, {
+            get(target, property, receiver) {
+              if (property === "sessionManager") return alternateBranchManager;
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          for (const handler of innerEvents.get("session_tree") ?? []) {
+            await handler({ type: "session_tree", newLeafId: "alternate-branch", oldLeafId: ctx.sessionManager.getLeafId() }, alternateBranchContext);
+          }
+          const promptsBeforeAlternateBranch = approvalPrompts.length;
+          const branchDenied = await bash(retryCommand, process.cwd(), 10);
+          assert(branchDenied.exit_code === 42 && branchDenied.output.trim().startsWith("HTTP/1.1 403"), `approval leaked into a branch without its custom entry: ${branchDenied.formattedOutput}`);
+          assert(approvalPrompts.length === promptsBeforeAlternateBranch + 1, "branch without the approval did not request confirmation again");
+          await restartInnerSession();
+          const branchRestored = await bash(retryCommand, process.cwd(), 10);
+          assert(branchRestored.exit_code === 0 && branchRestored.output.trim().startsWith("HTTP/1.1 502"), `returning to the approved branch did not restore access: ${branchRestored.formattedOutput}`);
         });
         // Structured matches let callers consume results without reparsing prose.
         await record("search returns structured project matches", async () => {
@@ -442,11 +531,19 @@ export default function (pi: ExtensionAPI) {
           assert(result.structuredContent.matches.length === 1, "search exceeded the requested match limit");
           assert(result.structuredContent.truncated, "search did not report omitted matches");
         });
-        // The added APT capabilities caused a real leak in an earlier run.
-        // Verify Bash has NNP set, no effective capabilities, and unchanged real/effective IDs.
+        // NET_ADMIN belongs only to extension-owned startup firewall setup.
+        // Verify Bash has NNP set, no effective capabilities, and unchanged IDs.
         await record("ordinary sandbox commands cannot change uid, retain capabilities, or write dpkg state", async () => {
           const result = await bash("cap=$(awk '/^CapEff:/{print $2}' /proc/self/status); nnp=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status); test \"$cap\" = 0000000000000000 && test \"$nnp\" = 1 && test \"$(id -ru)\" = \"$(id -u)\" && test ! -w /var/lib/dpkg/status && printf '%s:%s' \"$cap\" \"$nnp\"");
           assert(result.exit_code === 0, `ordinary command retained UID transition capability or dpkg access: ${result.output}`);
+        });
+        await record("package tool builds an APT image for curl and makes it available to Bash", async () => {
+          const install = await tool("sandbox", { pkg_add: "curl" });
+          assert(install.details?.exitCode === 0 && !install.isError, `sandbox.pkg_add curl failed: ${JSON.stringify(install.content)}`);
+          const fixtureId = process.env.PI_SANDBOX_FIXTURE_ID;
+          if (fixtureId) assert(String(install.details.image).startsWith(`localhost/pi-sandbox-${fixtureId}-apt:`), `package image escaped the isolated test namespace: ${install.details.image}`);
+          const verify = await bash("curl --version");
+          assert(verify.exit_code === 0 && verify.output.startsWith("curl "), `curl was not available after pkg_add: ${verify.formattedOutput}`);
         });
         await record("package tool rejects shell syntax before execution", async () => {
           try {

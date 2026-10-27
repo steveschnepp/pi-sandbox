@@ -7,7 +7,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { parseEgressAllowlist, startManagedEgressProxy, type ManagedEgressProxy } from "./egress-proxy.ts";
 import { Type, type Static } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   createEditTool,
@@ -46,8 +46,7 @@ const EMBEDDED_DOCKERFILE = `FROM debian:stable-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# setpriv is the boundary between the container's APT capabilities and ordinary
-# non-root commands, which must not inherit DAC_OVERRIDE or package privileges.
+# setpriv clears inherited and ambient capabilities before ordinary commands.
 RUN apt-get update \\
     && apt-get install -y --no-install-recommends \\
        bash ca-certificates coreutils findutils file git nftables python3 python-is-python3 ripgrep util-linux \\
@@ -75,11 +74,13 @@ const searchOutputSchema = Type.Object({
 
 type SearchInput = Static<typeof searchSchema>;
 type SearchMatch = { path: string; line: number; text: string };
+type ProjectPackageState = { packages: string[]; upgraded: boolean };
+
+const EMPTY_PACKAGE_STATE: ProjectPackageState = { packages: [], upgraded: false };
 
 type RunOptions = {
   // One options record keeps process controls aligned with a single Podman call.
   cwd?: string;
-  user?: string;
   env?: NodeJS.ProcessEnv;
   onData?: (data: Buffer) => void;
   signal?: AbortSignal;
@@ -280,28 +281,51 @@ export default function (pi: ExtensionAPI) {
     if (verbose) process.stderr.write(`[podman-sandbox] ${message}\n`);
   };
   const hostCwd = path.resolve(process.cwd());
+  const outputDirectory = path.join(hostCwd, ".out");
   const guard = makeGuard(hostCwd);
-  // A per-process name prevents concurrent Pi sessions from sharing mutable
-  // package state or accidentally removing one another's containers.
-  const container = `pi-sandbox-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  async function prepareOutputDirectory(): Promise<string> {
+    await fs.mkdir(outputDirectory, { recursive: true });
+    const outputStat = await fs.lstat(outputDirectory);
+    if (!outputStat.isDirectory() || outputStat.isSymbolicLink()) throw new Error("project .out path must be a real directory");
+    const checked = await guard.directory(outputDirectory);
+    try {
+      await fs.writeFile(path.join(checked, ".gitignore"), "*\n", { flag: "wx", mode: 0o644 });
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    return checked;
+  }
+  // Each Pi session owns its own container; the project label and path hash
+  // make it recognizable without sharing container-local filesystem state.
+  const projectLabel = path.basename(hostCwd).toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 32) || "project";
+  const projectHash = crypto.createHash("sha256").update(hostCwd).digest("hex").slice(0, 8);
+  const packageProjectId = process.env.PI_SANDBOX_PACKAGE_PROJECT_ID?.replace(/[^A-Za-z0-9_-]/g, "_") || projectHash;
+  const container = `pi-sandbox-${projectLabel}-${projectHash}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  const packageStateRoot = process.env.PI_SANDBOX_PACKAGE_STATE_DIR || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "pi-sandbox", "projects", packageProjectId);
+  const packageStatePath = path.join(packageStateRoot, "packages.json");
   const hostUid = typeof process.getuid === "function" ? process.getuid() : 1000;
   const hostGid = typeof process.getgid === "function" ? process.getgid() : 1000;
+  let packageState: ProjectPackageState = { ...EMPTY_PACKAGE_STATE };
   let image = "";
+  let runtimeImage = "";
   let customImage = false;
   let sessionId = crypto.randomUUID();
   let lastBashCommandId = 0;
   let egressAllowlist = new Set<string>();
+  let approveEgressHost: (hostname: string, port: number) => Promise<boolean> = async () => false;
+  const pendingEgressApprovals = new Map<string, Promise<boolean>>();
   let managedProxy: ManagedEgressProxy | undefined;
   const nextBashCommandId = () => {
     lastBashCommandId = Math.max(Date.now(), lastBashCommandId + 1);
     return lastBashCommandId;
   };
-  // Changing the embedded build recipe changes the tag, so an old local image
-  // cannot masquerade as the current security/runtime contract.
+  // The base tag is derived only from the embedded recipe. Project-specific
+  // APT layers are separately tagged from the base and complete package state.
   const defaultImage = `localhost/pi-sandbox:${crypto.createHash("sha256").update(EMBEDDED_DOCKERFILE).digest("hex").slice(0, 16)}`;
   let podmanChecked = false;
   let started = false;
   let starting: Promise<void> | undefined;
+  let resetting: Promise<void> | undefined;
   let proxyStarting: Promise<ManagedEgressProxy> | undefined;
 
   async function checkPodman() {
@@ -315,38 +339,212 @@ export default function (pi: ExtensionAPI) {
     logVerbose("rootless Podman is available");
   }
 
-  async function ensureImage() {
-    // A caller-selected image must already exist; only the extension-owned
-    // recipe is built automatically so a typo cannot trigger an implicit pull.
+  async function readPackageState(): Promise<ProjectPackageState> {
+    try {
+      const parsed = JSON.parse(await fs.readFile(packageStatePath, "utf8"));
+      if (!parsed || !Array.isArray(parsed.packages)) throw new Error("invalid package manifest");
+      const packages = [...new Set(parsed.packages)];
+      if (packages.some((name) => typeof name !== "string" || !/^[a-z0-9][a-z0-9+.-]*$/.test(name))) {
+        throw new Error("package manifest contains an invalid Debian package name");
+      }
+      return { packages: packages.sort(), upgraded: parsed.upgraded === true };
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return { ...EMPTY_PACKAGE_STATE };
+      throw new Error(`could not read project package state: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function writePackageState(state: ProjectPackageState): Promise<void> {
+    await fs.mkdir(packageStateRoot, { recursive: true, mode: 0o700 });
+    const temporaryPath = path.join(packageStateRoot, `packages-${crypto.randomUUID()}.tmp`);
+    await fs.writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    await fs.rename(temporaryPath, packageStatePath);
+  }
+
+  async function buildImage(tag: string, recipe: string, buildArgs: string[] = [], noCache = false): Promise<void> {
+    const buildDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-sandbox-image-"));
+    const containerfile = path.join(buildDir, "Containerfile");
+    try {
+      await fs.writeFile(containerfile, recipe);
+      const built = await runPodman(["build", ...(noCache ? ["--no-cache"] : []), "--tag", tag, ...buildArgs, "--file", containerfile, buildDir], {
+        cwd: hostCwd,
+        timeout: 600,
+      });
+      if (built.code !== 0) throw new Error(`podman build failed (${built.code}): ${built.output.trim()}`);
+    } finally {
+      await fs.rm(buildDir, { recursive: true, force: true });
+    }
+  }
+
+  async function ensureBaseImage(): Promise<void> {
     await checkPodman();
     if (!image) image = defaultImage;
     const exists = await runPodman(["image", "exists", image], { timeout: 30 });
     if (exists.code === 0) {
-      logVerbose(`sandbox image is available: ${image}`);
+      logVerbose(`base image is available: ${image}`);
       return;
     }
     if (exists.code !== 1) throw new Error(`podman image exists failed (${exists.code}): ${exists.output.trim()}`);
-    if (customImage) throw new Error(`sandbox image not found locally: ${image}`);
+    if (customImage) throw new Error(`sandbox base image not found locally: ${image}`);
 
-    const buildDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-sandbox-image-"));
-    const containerfile = path.join(buildDir, "Containerfile");
+    logVerbose(`building embedded base image: ${image}`);
+    await buildImage(image, EMBEDDED_DOCKERFILE);
+    logVerbose(`embedded base image built: ${image}`);
+  }
+
+  function projectUpgradeImageTag(state: ProjectPackageState): string | undefined {
+    if (!state.upgraded) return undefined;
+    const key = crypto.createHash("sha256").update(JSON.stringify({ base: image, projectId: packageProjectId, upgraded: true })).digest("hex").slice(0, 16);
+    return `localhost/pi-sandbox-${packageProjectId}-upgrade:${key}`;
+  }
+
+  function projectPackageImageTag(parentImage: string, state: ProjectPackageState): string | undefined {
+    if (state.packages.length === 0) return undefined;
+    const key = crypto.createHash("sha256").update(JSON.stringify({ parent: parentImage, projectId: packageProjectId, packages: state.packages })).digest("hex").slice(0, 16);
+    return `localhost/pi-sandbox-${packageProjectId}-apt:${key}`;
+  }
+
+  async function deriveProjectImage(
+    state: ProjectPackageState,
+    options: { forceRefresh?: boolean; forceUpgrade?: boolean } = {},
+  ): Promise<string> {
+    let parentImage = image;
+    if (state.upgraded) {
+      const upgradeImage = projectUpgradeImageTag(state)!;
+      const exists = await runPodman(["image", "exists", upgradeImage], { timeout: 30 });
+      if (exists.code === 0 && !options.forceUpgrade) {
+        logVerbose(`project upgrade image is available: ${upgradeImage}`);
+      } else if (exists.code === 0 || exists.code === 1) {
+        const recipe = `ARG BASE_IMAGE
+FROM \${BASE_IMAGE}
+RUN apt-get update \\
+    && apt-get upgrade -y \\
+    && rm -rf /var/lib/apt/lists/*
+`;
+        logVerbose(`building project upgrade image: ${upgradeImage}`);
+        await buildImage(upgradeImage, recipe, ["--build-arg", `BASE_IMAGE=${image}`], options.forceUpgrade);
+      } else {
+        throw new Error(`podman image exists failed (${exists.code}): ${exists.output.trim()}`);
+      }
+      parentImage = upgradeImage;
+    }
+
+    const packageImage = projectPackageImageTag(parentImage, state);
+    if (!packageImage) return parentImage;
+    const exists = await runPodman(["image", "exists", packageImage], { timeout: 30 });
+    if (exists.code === 0 && !options.forceRefresh && !options.forceUpgrade) {
+      logVerbose(`project APT image is available: ${packageImage}`);
+      return packageImage;
+    }
+    if (exists.code !== 0 && exists.code !== 1) throw new Error(`podman image exists failed (${exists.code}): ${exists.output.trim()}`);
+
+    const aptPackages = state.packages.map(shellQuote).join(" ");
+    const install = ` && apt-get install --no-remove -y --no-install-recommends ${aptPackages}`;
+    const recipe = `ARG BASE_IMAGE
+FROM \${BASE_IMAGE}
+RUN apt-get update${install} \\
+    && rm -rf /var/lib/apt/lists/*
+`;
+    logVerbose(`building project APT image from the full explicit package list: ${packageImage}`);
+    await buildImage(packageImage, recipe, ["--build-arg", `BASE_IMAGE=${parentImage}`], options.forceRefresh || options.forceUpgrade);
+    return packageImage;
+  }
+
+  async function ensureImage(): Promise<void> {
+    await ensureBaseImage();
+    runtimeImage = await deriveProjectImage(packageState);
+    logVerbose(`session image is ready: ${runtimeImage}`);
+  }
+
+  async function preparePackageState(
+    next: ProjectPackageState,
+    options: { forceRefresh?: boolean; forceUpgrade?: boolean } = {},
+  ): Promise<void> {
+    if (resetting) await resetting;
+    if (starting) await starting.catch(() => undefined);
+    await ensureBaseImage();
+    const nextRuntimeImage = await deriveProjectImage(next, options);
+    const changed = JSON.stringify(next) !== JSON.stringify(packageState);
+    if (started && (changed || options.forceRefresh || options.forceUpgrade)) {
+      const removed = await runPodman(["rm", "-f", container], { timeout: 30 });
+      if (removed.code !== 0) throw new Error(`podman rm -f failed (${removed.code}): ${removed.output.trim()}`);
+      started = false;
+    }
+    if (changed) await writePackageState(next);
+    packageState = next;
+    runtimeImage = nextRuntimeImage;
+    logVerbose(`project package state updated: ${packageState.packages.join(", ") || "(no explicit packages)"}`);
+  }
+
+  async function mutatePackageState(
+    update: (current: ProjectPackageState) => ProjectPackageState,
+    options: { forceRefresh?: boolean; forceUpgrade?: boolean } = {},
+  ): Promise<ProjectPackageState> {
+    // The package manifest is host-side and never mounted into the sandbox.
+    // Atomic replacement avoids partial state; cross-process lost updates are
+    // accepted for this local development tool, while APT receives the full list.
+    packageState = await readPackageState();
+    const next = update(packageState);
+    next.packages = [...new Set(next.packages)].sort();
+    await preparePackageState(next, options);
+    return next;
+  }
+
+  function restoreEgressAllowlist(ctx: ExtensionContext): void {
+    egressAllowlist.clear();
+    for (const hostname of parseEgressAllowlist(String(pi.getFlag("sandbox-egress-allow") ?? ""))) egressAllowlist.add(hostname);
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== "sandbox-egress-allow") continue;
+      const data = entry.data as { hostname?: unknown } | undefined;
+      if (typeof data?.hostname !== "string") continue;
+      try {
+        const restored = parseEgressAllowlist(data.hostname);
+        if (restored.size === 1) egressAllowlist.add([...restored][0]);
+      } catch {
+        logVerbose("ignored invalid sandbox egress approval in session history");
+      }
+    }
+  }
+
+  async function requestEgressApproval(hostname: string, port: number, ctx: ExtensionContext): Promise<boolean> {
+    if (egressAllowlist.has(hostname)) return true;
+    const pending = pendingEgressApprovals.get(hostname);
+    if (pending) return pending;
+
+    const approval = (async () => {
+      if (!ctx.hasUI || (port !== 80 && port !== 443)) return false;
+      let normalized: string;
+      try {
+        normalized = [...parseEgressAllowlist(hostname)][0];
+      } catch {
+        return false;
+      }
+      if (normalized !== hostname) return false;
+      const approvalBranchLeaf = ctx.sessionManager.getLeafId();
+      const approved = await ctx.ui.confirm(
+        "Allow sandbox network destination?",
+        `The sandbox proxy denied ${hostname}:${port}. Allow this exact DNS hostname for HTTP (port 80) and HTTPS (port 443) in this session branch? The proxy will still reject private addresses and other ports.`,
+      );
+      if (!approved || ctx.sessionManager.getLeafId() !== approvalBranchLeaf) return false;
+      if (egressAllowlist.has(hostname)) return true;
+      pi.appendEntry("sandbox-egress-allow", { hostname });
+      egressAllowlist.add(hostname);
+      ctx.ui.notify(`Allowed ${hostname} through the sandbox proxy for this session branch`, "info");
+      logVerbose(`session branch approved proxy hostname ${hostname}`);
+      return true;
+    })();
+    pendingEgressApprovals.set(hostname, approval);
     try {
-      // A real Containerfile avoids Podman's /dev/stdin dependency, which is
-      // unavailable in some service/RPC launch environments.
-      logVerbose(`building embedded sandbox image: ${image}`);
-      await fs.writeFile(containerfile, EMBEDDED_DOCKERFILE);
-      const built = await runPodman(["build", "--tag", image, "--file", containerfile, hostCwd], { cwd: hostCwd, timeout: 600 });
-      if (built.code !== 0) throw new Error(`podman build failed (${built.code}): ${built.output.trim()}`);
-      logVerbose(`embedded sandbox image built: ${image}`);
+      return await approval;
     } finally {
-      await fs.rm(buildDir, { recursive: true, force: true });
+      if (pendingEgressApprovals.get(hostname) === approval) pendingEgressApprovals.delete(hostname);
     }
   }
 
   async function ensureProxy(): Promise<ManagedEgressProxy> {
     if (managedProxy) return managedProxy;
     if (!proxyStarting) {
-      proxyStarting = startManagedEgressProxy(egressAllowlist, sessionId);
+      proxyStarting = startManagedEgressProxy(egressAllowlist, sessionId, (hostname, port) => approveEgressHost(hostname, port));
     }
     try {
       managedProxy = await proxyStarting;
@@ -358,6 +556,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureContainer() {
+    if (resetting) await resetting;
     if (started) return;
     if (starting) return starting;
     starting = (async () => {
@@ -369,15 +568,18 @@ export default function (pi: ExtensionAPI) {
         "--volume", `${hostCwd}:${hostCwd}:rw`,
         "--userns=keep-id", "--user", `${hostUid}:${hostGid}`,
         "--workdir", hostCwd,
+        "--read-only",
+        "--tmpfs", "/tmp:rw,nosuid,nodev",
+        "--tmpfs", "/var/tmp:rw,nosuid,nodev",
+        "--tmpfs", "/run:rw,nosuid,nodev",
         "--cap-drop=ALL",
-        // NET_ADMIN is used only once to install the network-namespace egress
-        // filter. All tool execs drop it before running user/package commands.
+        // NET_ADMIN is used only by extension-owned startup code to install the
+        // namespace firewall; Bash runs as the mapped unprivileged UID.
         "--cap-add=NET_ADMIN",
-        "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE",
         // PR_SET_NO_NEW_PRIVS makes SUID/SGID bits and file capabilities unable
         // to grant new privilege to any exec'd command in the container.
         "--security-opt=no-new-privileges",
-        "--pids-limit=512", image, "sleep", "infinity",
+        "--pids-limit=512", runtimeImage, "sleep", "infinity",
       ]);
       if (result.code !== 0) throw new Error(`podman run failed (${result.code}): ${result.output.trim()}`);
       try {
@@ -394,6 +596,7 @@ export default function (pi: ExtensionAPI) {
           "nft add rule inet pi_sandbox_egress output meta skuid 0 accept",
           "nft add rule inet pi_sandbox_egress output meta skuid 42 accept",
           `nft add rule inet pi_sandbox_egress output ip daddr ${gateway} tcp dport ${proxy.port} accept`,
+          "nft add rule inet pi_sandbox_egress output reject with icmpx type admin-prohibited",
         ].join(" && ");
         const installed = await runPodman(["exec", "--user", "0", container, "sh", "-lc", firewall]);
         if (installed.code !== 0) throw new Error(`failed to install sandbox egress policy (${installed.code}): ${installed.output.trim()}`);
@@ -409,19 +612,50 @@ export default function (pi: ExtensionAPI) {
 
   const exec = async (command: string, options: RunOptions = {}) => {
     await ensureContainer();
-    // Package maintenance is the only caller that requests container root.
-    // Ordinary execs always name the mapped UID/GID explicitly; no-new-privileges
-    // plus a zero effective capability set prevents setuid paths from changing it.
     const proxyEnvironment = Object.entries(options.proxyEnv ?? {}).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
-    const execution = options.user
-      ? ["setpriv", "--bounding-set=-net_admin", "--inh-caps=-all", "--ambient-caps=-all", "--", "sh", "-lc", command]
-      : ["setpriv", "--inh-caps=-all", "--ambient-caps=-all", "--", "sh", "-lc", command];
-    logVerbose(`executing sandbox command as ${options.user ? `container user ${options.user}` : "mapped user with capabilities cleared"} in ${options.cwd ?? hostCwd}`);
+    const execution = ["setpriv", "--inh-caps=-all", "--ambient-caps=-all", "--", "sh", "-lc", command];
+    logVerbose(`executing sandbox command as mapped user with capabilities cleared in ${options.cwd ?? hostCwd}`);
     return runPodman([
-      "exec", "--user", options.user ?? `${hostUid}:${hostGid}`, ...proxyEnvironment, "--workdir", options.cwd ?? hostCwd, container,
+      "exec", "--user", `${hostUid}:${hostGid}`, ...proxyEnvironment, "--workdir", options.cwd ?? hostCwd, container,
       ...execution,
     ], options);
   };
+
+  async function resetSandboxState() {
+    if (resetting) return resetting;
+    resetting = (async () => {
+      if (starting) await starting.catch(() => undefined);
+      await ensureBaseImage();
+      const currentState = await readPackageState();
+      if (started) {
+        logVerbose(`resetting sandbox container: ${container}`);
+        const removed = await runPodman(["rm", "-f", container], { timeout: 30 });
+        if (removed.code !== 0) throw new Error(`podman rm -f failed (${removed.code}): ${removed.output.trim()}`);
+        started = false;
+      }
+
+      const imageList = await runPodman(["images", "--format", "{{.Repository}}:{{.Tag}}"], { timeout: 30 });
+      if (imageList.code !== 0) throw new Error(`podman images failed (${imageList.code}): ${imageList.output.trim()}`);
+      const derivedPrefixes = [
+        `localhost/pi-sandbox-${packageProjectId}-apt:`,
+        `localhost/pi-sandbox-${packageProjectId}-upgrade:`,
+      ];
+      const derivedImages = imageList.output.split("\n").filter((tag) => derivedPrefixes.some((prefix) => tag.startsWith(prefix)));
+      for (const tag of derivedImages) {
+        const removed = await runPodman(["rmi", tag], { timeout: 60 });
+        if (removed.code !== 0) throw new Error(`podman rmi ${tag} failed (${removed.code}): ${removed.output.trim()}`);
+      }
+      packageState = currentState;
+      runtimeImage = await deriveProjectImage(packageState);
+      logVerbose(`sandbox reset rebuilt project image ${runtimeImage} from retained base ${image} and the full package list`);
+    })();
+    const operation = resetting;
+    try {
+      await operation;
+    } finally {
+      if (resetting === operation) resetting = undefined;
+    }
+  }
 
   const readOps: ReadOperations = {
     // Host file APIs preserve Pi's normal file semantics, so every path must
@@ -483,6 +717,7 @@ export default function (pi: ExtensionAPI) {
       const checkedCwd = await guard.directory(cwd);
       const proxy = await ensureProxy();
       const proxyUrl = `http://${proxy.token}@host.containers.internal:${proxy.port}`;
+      const commandOutputDirectory = await prepareOutputDirectory();
       const commandId = nextBashCommandId();
       const result = await exec(command, {
         ...options,
@@ -498,8 +733,8 @@ export default function (pi: ExtensionAPI) {
           no_proxy: "",
         },
         outputFiles: {
-          stdoutPath: path.join(os.tmpdir(), `session-${sessionId}-${commandId}.out`),
-          stderrPath: path.join(os.tmpdir(), `session-${sessionId}-${commandId}.err`),
+          stdoutPath: path.join(commandOutputDirectory, `session-${sessionId}-${commandId}.out`),
+          stderrPath: path.join(commandOutputDirectory, `session-${sessionId}-${commandId}.err`),
         },
       });
       return { exitCode: result.code };
@@ -606,7 +841,7 @@ export default function (pi: ExtensionAPI) {
   const bashTool = createBashTool(hostCwd, { operations: bashOps, exposeSessionEnvironment: false });
   pi.registerTool({
     ...bashTool,
-    description: "Execute a bash command inside the Podman sandbox. Stdout and stderr are saved to separate host-side session files. The result shows up to 128 lines per stream, with the full file path and line count when longer, plus the exit code. Use search instead of shell grep/rg for source lookup.",
+    description: "Execute a bash command inside the Podman sandbox. Stdout and stderr are saved under the ignored project .out/ directory and can be opened with the read tool. The result shows up to 128 lines per stream, with the full file path and line count when longer, plus the exit code. Use search instead of shell grep/rg for source lookup.",
     promptGuidelines: [
       "Use the native search tool for source text lookup instead of running grep, rg, or ripgrep in bash.",
     ],
@@ -615,65 +850,98 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Inspect or modify sandbox-owned Debian packages. Use list to show packages explicitly added through this tool, or pkg_add to install one package. APT metadata is refreshed automatically for installs.",
+    description: "Inspect the per-project explicit Debian package list or add one package. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
     parameters: packageSchema,
-    async execute(_id, input, signal, onUpdate) {
-      let command: string;
-      let user: string | undefined;
+    async execute(_id, input) {
       if ("list" in input) {
-        command = "sort -u /tmp/pi-sandbox-explicit-packages 2>/dev/null || true";
-      } else {
-        // Restrict the model to additive Debian package names. Running this
-        // command as namespace root is deliberate; uninstall/upgrade remain
-        // user-only slash commands because they mutate the base environment.
-        if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
-          throw new Error("pkg_add accepts Debian package names only");
-        }
-        const quoted = `'${input.pkg_add.replaceAll("'", "'\\''")}'`;
-        // Refresh metadata transparently before every installation. Track only
-        // packages explicitly requested through this tool, not dependencies.
-        command = `apt-get update && apt-get install --no-remove -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`;
-        user = "0";
+        packageState = await readPackageState();
+        const text = packageState.packages.length ? packageState.packages.join("\n") : "No explicitly added packages";
+        return { content: [{ type: "text", text }], details: { packages: packageState.packages } };
       }
-      const result = await exec(command, { cwd: hostCwd, user, signal, onData: onUpdate ? (d) => onUpdate({ content: [{ type: "text", text: d.toString() }], details: undefined }) : undefined });
-      return { content: [{ type: "text", text: result.output }], details: { exitCode: result.code }, isError: result.code !== 0 };
+      if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
+        throw new Error("pkg_add accepts Debian package names only");
+      }
+      try {
+        await mutatePackageState((current) => ({
+          ...current,
+          packages: [...current.packages, input.pkg_add],
+        }));
+        return {
+          content: [{ type: "text", text: `Added ${input.pkg_add} to the project APT image. The next sandbox command will use the updated image.` }],
+          details: { exitCode: 0, packages: packageState.packages, image: runtimeImage },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: message }], details: { exitCode: 1 }, isError: true };
+      }
     },
   });
 
   pi.registerCommand("sandbox", {
     // Maintenance actions that can alter package state remain user initiated,
     // separate from the narrower model-callable additive package interface.
-    description: "Manage the Podman sandbox (refresh, upgrade, add, remove, list)",
+    description: "Manage the Podman sandbox (refresh, upgrade, add, remove, list, reset)",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const operation = parts.shift();
       const packageName = parts.shift();
-      if (parts.length > 0 || !operation || (operation !== "list" && !packageName)) {
-        ctx.ui.notify("Usage: /sandbox list|refresh|upgrade|add <package>|remove <package>", "warning");
+      const needsPackage = operation === "add" || operation === "remove";
+      if (parts.length > 0 || !operation || (needsPackage && !packageName) || (!needsPackage && packageName)) {
+        ctx.ui.notify("Usage: /sandbox list|refresh|upgrade|add <package>|remove <package>|reset", "warning");
         return;
       }
       if (packageName && !/^[a-z0-9][a-z0-9+.-]*$/.test(packageName)) {
         ctx.ui.notify("Invalid Debian package name", "error");
         return;
       }
-      const quoted = packageName ? shellQuote(packageName) : "";
-      const commands: Record<string, { command: string; user?: string }> = {
-        list: { command: "sort -u /tmp/pi-sandbox-explicit-packages 2>/dev/null || true" },
-        refresh: { command: "apt-get update", user: "0" },
-        upgrade: { command: "apt-get update && apt-get upgrade -y", user: "0" },
-        add: { command: `apt-get update && apt-get install --no-remove -y --no-install-recommends ${quoted} && touch /tmp/pi-sandbox-explicit-packages && chmod 0644 /tmp/pi-sandbox-explicit-packages && { grep -qxF ${quoted} /tmp/pi-sandbox-explicit-packages || echo ${quoted} >> /tmp/pi-sandbox-explicit-packages; }`, user: "0" },
-        remove: { command: `apt-get purge -y ${quoted} && apt-get autoremove --purge -y && (grep -vxF ${quoted} /tmp/pi-sandbox-explicit-packages > /tmp/pi-sandbox-explicit-packages.new 2>/dev/null || true) && (test -f /tmp/pi-sandbox-explicit-packages.new && mv /tmp/pi-sandbox-explicit-packages.new /tmp/pi-sandbox-explicit-packages || true)`, user: "0" },
-      };
-      const selected = commands[operation];
-      if (!selected) {
-        ctx.ui.notify("Unknown sandbox operation", "warning");
+      if (operation === "reset") {
+        try {
+          await resetSandboxState();
+          ctx.ui.notify("reset completed; the project container and derived APT image were rebuilt from the retained base and complete package list", "info");
+        } catch (error) {
+          ctx.ui.notify(`reset failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
         return;
       }
       try {
-        const result = await exec(selected.command, { cwd: hostCwd, user: selected.user });
-        const output = result.output.trim();
-        if (result.code !== 0) throw new Error(output || `exit code ${result.code}`);
-        ctx.ui.notify(output ? output.slice(-2000) : `${operation} completed`, "info");
+        if (operation === "list") {
+          await ensureContainer();
+          packageState = await readPackageState();
+          const packageList = packageState.packages.length ? packageState.packages.join(", ") : "No explicitly added packages";
+          ctx.ui.notify(`list completed: ${packageList}`, "info");
+          return;
+        }
+        if (operation === "refresh") {
+          packageState = await readPackageState();
+          if (packageState.packages.length === 0) {
+            ctx.ui.notify("No explicit APT packages to refresh", "info");
+            return;
+          }
+          await preparePackageState(packageState, { forceRefresh: true });
+          ctx.ui.notify("refresh completed; the complete package list was reinstalled in the derived image", "info");
+          return;
+        }
+        if (operation === "upgrade") {
+          await mutatePackageState((current) => ({ ...current, upgraded: true }), { forceUpgrade: true });
+          ctx.ui.notify("upgrade completed; the project upgrade and APT layers were rebuilt", "info");
+          return;
+        }
+        if (operation === "add") {
+          await mutatePackageState((current) => ({ ...current, packages: [...current.packages, packageName!] }));
+          ctx.ui.notify(`add completed; ${packageName} is in the project APT image`, "info");
+          return;
+        }
+        if (operation === "remove") {
+          packageState = await readPackageState();
+          if (!packageState.packages.includes(packageName!)) {
+            ctx.ui.notify(`${packageName} is not in the explicit project package list`, "warning");
+            return;
+          }
+          await mutatePackageState((current) => ({ ...current, packages: current.packages.filter((name) => name !== packageName) }));
+          ctx.ui.notify(`remove completed; ${packageName} is absent from the rebuilt project APT image`, "info");
+          return;
+        }
+        ctx.ui.notify("Unknown sandbox operation", "warning");
       } catch (error) {
         ctx.ui.notify(`${operation} failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
@@ -688,16 +956,22 @@ export default function (pi: ExtensionAPI) {
     customImage = Boolean(image);
     try {
       sessionId = String(ctx.sessionManager.getSessionId() ?? sessionId).replace(/[^A-Za-z0-9_-]/g, "_");
-      egressAllowlist = parseEgressAllowlist(String(pi.getFlag("sandbox-egress-allow") ?? ""));
+      restoreEgressAllowlist(ctx);
+      approveEgressHost = (hostname, port) => requestEgressApproval(hostname, port, ctx);
+      packageState = await readPackageState();
       await checkPodman();
       await ensureImage();
       await ensureProxy();
-      ctx.ui.notify(`Podman sandbox ready: ${image || defaultImage}`, "info");
+      ctx.ui.notify(`Podman sandbox ready: ${runtimeImage || image || defaultImage}`, "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logVerbose(`startup failed: ${message}`);
       ctx.ui.notify(`Podman sandbox startup failed: ${message}`, "error");
     }
+  });
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreEgressAllowlist(ctx);
+    approveEgressHost = (hostname, port) => requestEgressApproval(hostname, port, ctx);
   });
   pi.on("session_shutdown", async () => {
     if (started) {

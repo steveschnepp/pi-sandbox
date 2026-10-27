@@ -4,7 +4,7 @@ This directory contains two independent experiments. Neither installs packages n
 
 ## Rootless nftables enforcement
 
-`egress-netfilter-poc.py` creates local TCP receivers on the host and runs one disposable rootless Podman container. It borrows the host `nft` binary and its shared-library directory read-only, creates a default-drop OUTPUT chain in the container's network namespace, and checks that:
+`egress-netfilter-poc.py` creates local TCP receivers on the host and runs one disposable rootless Podman container. It borrows the host `nft` binary and its shared-library directory read-only, creates a default-drop OUTPUT chain with a final explicit REJECT rule in the container's network namespace, and checks that:
 
 - the mapped coding UID reaches only the configured proxy endpoint;
 - the mapped UID cannot reach a second host TCP port directly;
@@ -20,7 +20,7 @@ Run from the project root, substituting an available image as appropriate:
 ./poc/test_egress/egress-netfilter-poc.py IMAGE --nft /usr/sbin/nft --libdir /lib/x86_64-linux-gnu
 ```
 
-The experiment binds host listeners on ephemeral ports and discovers `host.containers.internal` from inside the container. The runner adds `CAP_KILL` only to its disposable test container so `timeout` can terminate the blocked mapped-user probe; it is not part of the extension's runtime capability policy. The test does not alter the host firewall. It is a proof of the UID/rule split in this Podman network setup, not a complete audit of every bypass path or a DoS test.
+The experiment binds host listeners on ephemeral ports and discovers `host.containers.internal` from inside the container. The runner adds `CAP_KILL` only to its disposable test container so `timeout` can terminate the negative-control probe if the firewall regresses to silently dropping traffic; it is not part of the extension's runtime capability policy. The test does not alter the host firewall. It is a proof of the UID/rule split in this Podman network setup, not a complete audit of every bypass path or a DoS test.
 
 ## Production HTTP proxy checks
 
@@ -34,4 +34,4 @@ A passing run prints `proxy allowlist, authentication, port policy, CONNECT reje
 
 ## Findings
 
-The retained rootless nftables run showed that, in the tested Podman 5.4.2 Netavark/Pasta environment, UID 1000 reached the permitted proxy listener while direct mapped-user egress was blocked; UID 0 and UID 42 retained egress. A root process with `NET_ADMIN` removed could not flush the ruleset. The extension's proxy checks additionally demonstrated authenticated access control and exact DNS-host allowlisting without TLS interception. Network egress remains distinct from pathname confinement.
+The retained rootless nftables run showed that, in the tested Podman 5.4.2 Netavark/Pasta environment, UID 1000 reached the permitted proxy listener while direct mapped-user egress was rejected promptly and the receiver got no connection; UID 0 and UID 42 retained egress. A root process with `NET_ADMIN` removed could not flush the ruleset. The extension's proxy checks additionally demonstrated authenticated access control and exact DNS-host allowlisting without TLS interception. Network egress remains distinct from pathname confinement.

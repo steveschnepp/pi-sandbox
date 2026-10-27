@@ -137,7 +137,56 @@ class RpcProcess:
         message = str(record.get("message", ""))
         if message.startswith("list failed:"):
             raise RuntimeError(f"sandbox list operation failed: {message}")
+        if message.startswith("reset failed:"):
+            raise RuntimeError(f"sandbox reset operation failed: {message}")
         return message if message.startswith(prefix) else None
+
+
+def cleanup_test_containers(pi_pid: int) -> bool:
+    listed = subprocess.run(
+        ["podman", "ps", "--all", "--format", "{{.ID}} {{.Names}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        print(f"warning: could not list containers for test cleanup: {listed.stderr.strip()}", file=sys.stderr)
+        return False
+    identifiers = [
+        fields[0]
+        for line in listed.stdout.splitlines()
+        if len(fields := line.split(maxsplit=1)) == 2
+        and fields[1].startswith("pi-sandbox-")
+        and f"-{pi_pid}-" in fields[1]
+    ]
+    if not identifiers:
+        return True
+    removed = subprocess.run(["podman", "rm", "--force", *identifiers], check=False, capture_output=True, text=True)
+    if removed.returncode != 0:
+        print(f"warning: test-container cleanup failed: {removed.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def cleanup_test_images(project_id: str) -> bool:
+    listed = subprocess.run(
+        ["podman", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        print(f"warning: could not list images for test cleanup: {listed.stderr.strip()}", file=sys.stderr)
+        return False
+    prefixes = (f"localhost/pi-sandbox-{project_id}-apt:", f"localhost/pi-sandbox-{project_id}-upgrade:")
+    tags = [line for line in listed.stdout.splitlines() if line.startswith(prefixes)]
+    if not tags:
+        return True
+    removed = subprocess.run(["podman", "rmi", *tags], check=False, capture_output=True, text=True)
+    if removed.returncode != 0:
+        print(f"warning: test-image cleanup failed: {removed.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,10 +239,14 @@ def main() -> int:
     fixture_id = secrets.token_hex(8) if args.security else None
     security_outside = PROJECT_ROOT.parent / f".pi-sandbox-security-outside-{fixture_id}" if fixture_id else None
     security_tmp = Path(tempfile.gettempdir()) / f"pi-sandbox-security-tmp-{fixture_id}" if fixture_id else None
+    security_package_state = SCRATCH / f"package-state-{fixture_id}" if fixture_id else None
     if host_canary:
         process_env["PI_SANDBOX_HOST_CANARY"] = host_canary
     if fixture_id:
         process_env["PI_SANDBOX_FIXTURE_ID"] = fixture_id
+        process_env["PI_SANDBOX_PACKAGE_PROJECT_ID"] = fixture_id
+    if security_package_state:
+        process_env["PI_SANDBOX_PACKAGE_STATE_DIR"] = str(security_package_state)
     if security_outside and security_tmp:
         process_env["PI_SANDBOX_SECURITY_OUTSIDE"] = str(security_outside)
         process_env["PI_SANDBOX_SECURITY_TMP"] = str(security_tmp)
@@ -249,9 +302,58 @@ def main() -> int:
             print(f"Security tests: {passed} passed, {failed_count} failed, {skipped} skipped")
             if failed_count:
                 failed = True
+            else:
+                reset_id = "rpc-test-security-package-reset"
+                rpc.send({"id": reset_id, "type": "prompt", "message": "/sandbox reset"})
+                reset_response = rpc.wait_response(reset_id, args.timeout)
+                if reset_response.get("data", {}).get("disposition") != "handled":
+                    raise RuntimeError("expected /sandbox reset after the package test to be handled")
+                reset_notice = rpc.wait_for_notice("reset completed", args.timeout)
+                print(f"PASS: {reset_notice}")
+
+                list_id = "rpc-test-security-package-list"
+                rpc.send({"id": list_id, "type": "prompt", "message": "/sandbox list"})
+                list_response = rpc.wait_response(list_id, args.timeout)
+                if list_response.get("data", {}).get("disposition") != "handled":
+                    raise RuntimeError("expected /sandbox list after reset to be handled")
+                list_notice = rpc.wait_for_notice("list completed:", args.timeout)
+                if "curl" not in list_notice:
+                    raise RuntimeError(f"project package manifest did not preserve curl across reset: {list_notice}")
+                print("PASS: the derived APT package list survived reset and a fresh container started.")
+
+                final_reset_id = "rpc-test-security-final-reset"
+                rpc.send({"id": final_reset_id, "type": "prompt", "message": "/sandbox reset"})
+                final_reset_response = rpc.wait_response(final_reset_id, args.timeout)
+                if final_reset_response.get("data", {}).get("disposition") != "handled":
+                    raise RuntimeError("expected final /sandbox reset to be handled")
+                rpc.wait_for_notice("reset completed", args.timeout)
         else:
             rpc.wait_for_notice("list completed", args.timeout)
             print("PASS: RPC loaded the extension, registered /sandbox, and completed /sandbox list in the Podman sandbox.")
+
+            reset_id = "rpc-test-sandbox-reset"
+            rpc.send({"id": reset_id, "type": "prompt", "message": "/sandbox reset"})
+            reset_response = rpc.wait_response(reset_id, args.timeout)
+            if reset_response.get("data", {}).get("disposition") != "handled":
+                raise RuntimeError("expected /sandbox reset to be handled by the extension")
+            reset_notice = rpc.wait_for_notice("reset completed", args.timeout)
+            print(f"PASS: {reset_notice}")
+
+            recreate_id = "rpc-test-sandbox-list-after-reset"
+            rpc.send({"id": recreate_id, "type": "prompt", "message": "/sandbox list"})
+            recreate_response = rpc.wait_response(recreate_id, args.timeout)
+            if recreate_response.get("data", {}).get("disposition") != "handled":
+                raise RuntimeError("expected /sandbox list after reset to be handled by the extension")
+            rpc.wait_for_notice("list completed", args.timeout)
+            print("PASS: a fresh sandbox container started from the retained local image after reset.")
+
+            final_reset_id = "rpc-test-sandbox-final-reset"
+            rpc.send({"id": final_reset_id, "type": "prompt", "message": "/sandbox reset"})
+            final_reset_response = rpc.wait_response(final_reset_id, args.timeout)
+            if final_reset_response.get("data", {}).get("disposition") != "handled":
+                raise RuntimeError("expected final /sandbox reset to be handled by the extension")
+            rpc.wait_for_notice("reset completed", args.timeout)
+            print("PASS: final reset removed the smoke-test container.")
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:
         failed = True
         print(f"FAIL: {error}", file=sys.stderr)
@@ -285,8 +387,14 @@ def main() -> int:
             shutil.rmtree(security_outside, ignore_errors=True)
         if security_tmp:
             shutil.rmtree(security_tmp, ignore_errors=True)
+        if security_package_state:
+            shutil.rmtree(security_package_state, ignore_errors=True)
         if process is not None and fixture_id:
             shutil.rmtree(PROJECT_ROOT / f"security-test-{process.pid}-{fixture_id}", ignore_errors=True)
+            if not cleanup_test_containers(process.pid):
+                failed = True
+            if not cleanup_test_images(fixture_id):
+                failed = True
 
     stderr_contents = stderr_path.read_text(errors="replace") if stderr_path.exists() else ""
     protocol_contents = json.dumps(rpc.records, ensure_ascii=True) if rpc is not None else ""
