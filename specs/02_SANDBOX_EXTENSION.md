@@ -61,7 +61,7 @@ flowchart TD
   PodmanExec --> Command[Container command]
   Command -->|single RW bind mount| ProjectMount[Same project path in container]
   ProjectMount --- Project
-  Command -->|other container paths (read-only)| ReadOnly[Read-only container rootfs]
+  Command -->|other container paths| ReadOnly[Read-only container rootfs]
   Command -->|temporary writes| Tmpfs[/tmp /var/tmp /run tmpfs]
 ```
 

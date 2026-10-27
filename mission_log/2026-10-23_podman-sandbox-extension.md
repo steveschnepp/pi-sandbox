@@ -1552,3 +1552,22 @@ Replaced the single dense trust-boundary flowchart in `specs/02_SANDBOX_EXTENSIO
 |------|---------|
 | `specs/02_SANDBOX_EXTENSION.md` | Splits the trust-boundary map into file, UID, and network diagrams. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the documentation refinement. |
+
+## Session 58: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Mermaid Rendering Compatibility Fix
+
+The user reported GitHub's Mermaid parser rejecting an edge label in the file-access graph. Simplified the label from `other container paths (read-only)` to `other container paths`; the target node itself already identifies the rootfs as read-only. Kept the three focused file, UID, and network diagrams.
+
+### Test Results / Benchmarks
+
+- Inspected all Mermaid blocks after the correction; no other parenthesized edge labels remain.
+- `git diff --check`: passed.
+- Mission-log lint: passed.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | Removes Mermaid-incompatible parentheses from the file graph edge label. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the rendering correction. |
