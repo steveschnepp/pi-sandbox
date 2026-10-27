@@ -1028,3 +1028,21 @@ Reviewed the retained files, confirmed the only remaining Podman containers are 
 ### Next Steps
 
 - Stage the exact retained POC files and mission-log update, inspect the staged diff, and commit the retained artifacts. Preserve the unrelated untracked root files.
+
+## Session 44: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Committed the retained SUID and egress PoCs, their reproduction documentation, the POC index, and the append-only mission-log record in commit `889ab83` (`test: retain sandbox security POCs`). Verified the post-commit worktree contains only the pre-existing unrelated untracked root files `Makefile`, `fibo.c`, and `test_fibo.sh`; none were included in the commit.
+
+### What We Decided
+
+- Keep the focused experiment artifacts in the dedicated test commit and leave unrelated root files untouched.
+
+### Test Results / Benchmarks
+
+- The committed revision is `889ab83`; the focused SUID, nftables, proxy, syntax, diff, and mission-log checks passed before commit.
+
+### Next Steps
+
+- No further POC organization work is required from this handoff. Future work can extend the retained experiments or address the separately documented security boundary questions.
