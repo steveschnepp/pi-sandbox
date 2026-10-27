@@ -1571,3 +1571,22 @@ The user reported GitHub's Mermaid parser rejecting an edge label in the file-ac
 |------|---------|
 | `specs/02_SANDBOX_EXTENSION.md` | Removes Mermaid-incompatible parentheses from the file graph edge label. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the rendering correction. |
+
+## Session 59: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Mermaid Tmpfs Label Fix
+
+GitHub reported a second lexical error in the file-access Mermaid diagram at the slash-prefixed `/tmp`, `/var/tmp`, and `/run` node label. Replaced that display label with `Ephemeral tmpfs mounts`, retaining the `temporary writes` edge label; the exact mount paths remain specified in the surrounding prose and container contract. Also simplified the UID graph's setuid edge text to avoid punctuation that can be interpreted as Mermaid syntax.
+
+### Test Results / Benchmarks
+
+- Inspected the flowchart labels for the unsupported slash-prefixed token that GitHub reported.
+- `git diff --check`: passed.
+- Mission-log lint: passed.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | Removes parser-sensitive slash-prefixed display text from the trust-boundary graph. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the rendering follow-up. |

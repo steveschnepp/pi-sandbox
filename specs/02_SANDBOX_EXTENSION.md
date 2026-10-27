@@ -62,7 +62,7 @@ flowchart TD
   Command -->|single RW bind mount| ProjectMount[Same project path in container]
   ProjectMount --- Project
   Command -->|other container paths| ReadOnly[Read-only container rootfs]
-  Command -->|temporary writes| Tmpfs[/tmp /var/tmp /run tmpfs]
+  Command -->|temporary writes| Tmpfs[Ephemeral tmpfs mounts]
 ```
 
 The guard checks canonical paths before host filesystem operations; it is not an atomic descriptor-based sandbox. The container gets the project mount and its own root filesystem, not arbitrary host paths. Pi `read`/`write`/`edit`/`ls` remain host-side capabilities and should not be confused with container operations.
@@ -74,7 +74,7 @@ flowchart TD
   HostUser[Pi host UID:GID] -->|rootless Podman user namespace + keep-id| MappedIdentity[Mapped container UID:GID]
   MappedIdentity -->|ordinary podman exec| Setpriv[setpriv clears inherited and ambient capabilities]
   Setpriv --> BashUser[Bash runs as mapped UID:GID]
-  BashUser -->|NNP=1 prevents SUID/UID gain| SameIdentity[Real and effective IDs stay mapped]
+  BashUser -->|NNP=1 blocks setuid privilege gain| SameIdentity[Real and effective IDs stay mapped]
   Startup[Extension-owned firewall setup] -->|podman exec --user 0| NamespaceRoot[Container namespace root]
   NamespaceRoot -->|NET_ADMIN during startup| FirewallSetup[nftables rules installed]
   NamespaceRoot -.->|is not| HostRoot[Host root]
