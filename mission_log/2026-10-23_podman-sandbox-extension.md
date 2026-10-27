@@ -1419,3 +1419,75 @@ Extended the provider-free security adapter to simulate a tree switch to a branc
 ### Next Steps
 
 - None for the allowlist fix; preserve the distinction between configured CLI hosts and session-branch approvals.
+
+## Session 54: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Per-Port Egress and Sandbox Status
+
+Changed the egress allowlist from hostname-wide permissions to exact hostname/port pairs. A bare CLI entry such as `github.com` now means HTTPS/443 only; `github.com:80` explicitly allows HTTP/80, and both can be listed separately. Session approvals use the same pair keys, so approving HTTP does not implicitly permit HTTPS. The confirmation title is only `Allow <hostname>:<port>?` with an empty message, keeping the prompt limited to the detected destination. Older hostname-only custom approval entries restore as 443 only.
+
+Implemented `/sandbox` as the command/help summary plus quick counts and `/sandbox list` as verbose status. The summary reports explicit installed-package count, allowed destination count, container/image size, and proxy-audited HTTP and HTTPS CONNECT counts, denials, and transferred bytes. Detailed list includes package and `hostname:port` names. Container size uses Podman's rootfs and writable-layer sizes when running, otherwise the selected image size; the mounted project is excluded. Byte values use the requested binary-style `kiB`, `MiB`, `GiB` units.
+
+A first smoke run surfaced a harness isolation issue: the non-security RPC test shared the project's existing package manifest/image namespace, and reset correctly refused to remove a derived image still used by the live sandbox. The runner now assigns every run a random package project ID and state directory and cleans only its own containers/images. The live container remained running. Smoke coverage now checks both detailed `/sandbox list` and default `/sandbox` help/stats.
+
+### What We Learned
+
+- Port must be part of both the allowlist key and persisted approval data; host-only state cannot represent the requested distinction.
+- `podman container inspect --size` supplies rootfs and writable-layer byte counts, while image inspect is a suitable fallback before container creation.
+- The normal RPC smoke path mutates resources through reset, so its package manifest and derived image tags must be isolated just like the security suite.
+- Proxy audit records provide session-local counts for ordinary HTTP and HTTPS CONNECT requests, denials, and byte totals without inspecting TLS payloads.
+
+### What We Decided
+
+- Interpret a bare destination as port 443. Require explicit `:80` for HTTP, and treat each approved/provided port as independent.
+- Keep the user prompt to the detected exact pair only.
+- Preserve `/sandbox` as a non-mutating help-and-summary command; `/sandbox list` starts the current container and displays verbose details.
+- Keep the existing live sandbox container and project package state outside the RPC runner's cleanup namespace.
+
+### What We'd Do Differently
+
+- The first post-change smoke test was run before checking that its package/image namespace was isolated; it reached reset and revealed the collision. Isolate all stateful integration runners before invoking reset or image cleanup.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `egress-proxy.ts` | Parses and enforces exact hostname/port keys, with bare hosts defaulting to 443. |
+| `podman-sandbox.ts` | Persists port-specific approvals, uses minimal prompts, and implements quick `/sandbox` stats plus verbose `/sandbox list`. |
+| `README.md` | Documents per-port allowlist syntax, command output, statistics, and binary byte units. |
+| `poc/test_egress/egress-proxy-test.mjs` | Tests default-443 parsing, explicit HTTP/80, invalid ports, and independent approval. |
+| `poc/test_egress/README.md` | Describes the new port-specific proxy tests. |
+| `poc/podman-sandbox-security-test.ts` | Verifies exact-port prompts, persistence, branch restoration, and HTTP/80 not granting HTTPS/443. |
+| `poc/test-podman-sandbox-rpc.py` | Checks command/status output and isolates package state and derived images for every run. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appends this implementation and test record. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed parsing, port separation, deny/approve callbacks, authentication, and audit checks.
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 240`: passed, 42/42 checks, including approval persistence/restoration and separate HTTP/80 versus HTTPS/443 approval.
+- `./poc/test-podman-sandbox-rpc.py --timeout 120`: passed detailed list, default help/stats, reset/recreate, and final cleanup with isolated images.
+- Extension help loading, RPC-runner AST parse, and `git diff --check`: passed.
+- The pre-existing project container remained running after test runs.
+
+### Next Steps
+
+- None for the requested per-port behavior and status display.
+
+## Session 55: Podman Sandbox Extension (2026-10-27)
+
+### Verification Follow-up - HTTPS Default
+
+Added an end-to-end proxy assertion that a bare allowlist hostname permits CONNECT on 443 through the allowlist gate, then reaches the reserved `.example` hostname's deterministic DNS failure (502). This complements the existing assertion that HTTP/80 remains blocked unless `:80` is explicitly configured and that an HTTP/80 approval does not grant HTTPS/443.
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed, including default HTTPS/443, explicit HTTP/80, and independent per-port approval.
+- The full RPC security suite passed 42/42; the isolated smoke test passed `/sandbox list`, `/sandbox` stats/help, reset/recreate, and final cleanup.
+- The active project-labeled container remained running.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `poc/test_egress/egress-proxy-test.mjs` | Explicitly verifies bare-host HTTPS/443 reaches DNS resolution while unlisted HTTP/80 is rejected. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records final default-HTTPS verification. |

@@ -83,13 +83,13 @@ Each bash invocation redirects the Podman process's stdout and stderr to separat
 
 ## Bash network egress
 
-Bash processes have no direct network egress. The container's nftables OUTPUT policy permits ordinary commands to reach only the extension's host-side HTTP proxy; all other outbound packets hit an explicit `reject with icmpx type admin-prohibited` rule instead of being silently dropped, so connection attempts fail promptly rather than timing out. DNS and other protocols cannot bypass the proxy. Configure the proxy with comma-separated exact DNS hostnames:
+Bash processes have no direct network egress. The container's nftables OUTPUT policy permits ordinary commands to reach only the extension's host-side HTTP proxy; all other outbound packets hit an explicit `reject with icmpx type admin-prohibited` rule instead of being silently dropped, so connection attempts fail promptly rather than timing out. DNS and other protocols cannot bypass the proxy. Configure comma-separated exact DNS destinations:
 
 ```bash
-pi -e ./podman-sandbox.ts --sandbox-egress-allow github.com,api.github.com
+pi -e ./podman-sandbox.ts --sandbox-egress-allow github.com,api.github.com:80
 ```
 
-The default allowlist is empty. When a proxy request names an unlisted DNS hostname, Pi asks the user whether to allow that exact hostname for the current session branch; approval is saved as a non-model-visible custom session entry and restored only when resuming or navigating within a branch containing that approval. In non-interactive modes, unlisted hosts remain denied. A CLI allowlist entry is available immediately and is not changed by session approvals. The proxy accepts HTTP on port 80 and HTTPS tunnels with CONNECT on port 443. It resolves destination hostnames itself, pins a validated public address for each connection, rejects IP literals and private/reserved destinations, and writes request decisions, destination names, ports, and transferred byte counts to a session audit log under the host temporary directory. HTTPS payloads remain encrypted; the proxy does not inspect or log their contents. Use `--sandbox-verbose` to see the audit-log path.
+Each entry is an exact DNS hostname with an optional port. No suffix means HTTPS/443 only; add `:80` to allow HTTP for that hostname. For example, `github.com,api.github.com:80` allows HTTPS to `github.com` and HTTP to `api.github.com`, but not the reverse. On an unlisted request, Pi asks only to allow the detected `hostname:port`; approval applies to that pair alone and is saved as a non-model-visible custom session entry. It is restored only on branches containing that approval. In non-interactive modes, unlisted destinations remain denied. CLI entries are not changed by session approvals. The proxy resolves destination hostnames itself, pins a validated public address for each connection, rejects IP literals and private/reserved destinations, and writes request decisions, destinations, ports, and transferred byte counts to a session audit log under the host temporary directory. HTTPS payloads remain encrypted; the proxy does not inspect or log their contents. Use `--sandbox-verbose` to see the audit-log path.
 
 The session container drops all capabilities except `NET_ADMIN`, which extension-owned startup uses to install the egress firewall. Bash runs as the mapped UID/GID under `no-new-privileges` in the read-only rootfs; APT does not run in this container. Custom base images must provide `nft`, `getent`, `setpriv`, and Debian APT for derived package images.
 
@@ -101,9 +101,12 @@ The file tools currently use Pi's host-side filesystem APIs with project-boundar
 
 ## User-controlled sandbox maintenance
 
+Running `/sandbox` explains the available commands and shows quick counts for installed explicit packages, allowed `hostname:port` destinations, container size, and recorded HTTP/HTTPS proxy traffic. `/sandbox list` displays the verbose status, including package and destination names, rootfs and writable-layer sizes when the container is running, and transferred-byte counts. Sizes use binary units (`kiB`, `MiB`, `GiB`). Traffic totals come from this session's proxy audit log.
+
 LLM tools cannot remove packages or upgrade the sandbox. Those operations are available only through the user-facing slash command:
 
 ```text
+/sandbox
 /sandbox list
 /sandbox refresh
 /sandbox upgrade
@@ -135,7 +138,7 @@ For the full extension startup and command path, run the headless RPC integratio
 ./poc/test-podman-sandbox-rpc.py
 ```
 
-It starts Pi with only this extension loaded, checks that `/sandbox` is registered, invokes `/sandbox list` through the RPC prompt command, and waits for the extension's completion notification. The smoke path runs `/sandbox reset` and `/sandbox list` again to verify the project-derived image can be rebuilt and a fresh container started, followed by a final reset to remove test resources. No LLM provider is needed. The base image is reused when available; Podman builds it with normal caching when missing. Pass `--image <local-image>` to select an existing custom base image. The per-operation timeout defaults to 240 seconds and can be changed with `--timeout <seconds>`. On failure, Pi stderr is retained under `scratch/`. Add `--verbose` to print JSONL RPC records, Pi diagnostics, per-test progress, and extension startup/execution milestones. The extension also accepts `--sandbox-verbose` or Pi's `--verbose` when run directly.
+It starts Pi with only this extension loaded, checks that `/sandbox` is registered, runs `/sandbox list` and `/sandbox` to verify detailed status and the help/stats summary, then resets and recreates a fresh container before final cleanup. Each test run uses an isolated package manifest and project-derived image namespace so it cannot reset another session's derived image. No LLM provider is needed. The base image is reused when available; Podman builds it with normal caching when missing. Pass `--image <local-image>` to select an existing custom base image. The per-operation timeout defaults to 240 seconds and can be changed with `--timeout <seconds>`. On failure, Pi stderr is retained under `scratch/`. Add `--verbose` to print JSONL RPC records, Pi diagnostics, per-test progress, and extension startup/execution milestones. The extension also accepts `--sandbox-verbose` or Pi's `--verbose` when run directly.
 
 For security-boundary coverage, run the registered tools against disposable host and container fixtures:
 

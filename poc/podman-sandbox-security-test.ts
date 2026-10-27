@@ -463,15 +463,15 @@ export default function (pi: ExtensionAPI) {
             await new Promise<void>((resolve) => server.close(() => resolve()));
           }
         });
-        await record("sandbox proxy asks before denying an unlisted DNS hostname", async () => {
+        await record("sandbox proxy asks before denying an unlisted hostname/port pair", async () => {
           const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://unlisted.invalid/ HTTP/1.1\\r\\nHost: unlisted.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
           const result = await bash(command, process.cwd(), 10);
           assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 403"), `proxy did not deny the unlisted DNS destination: ${result.formattedOutput}`);
           const prompt = approvalPrompts.at(-1);
-          assert(prompt?.title === "Allow sandbox network destination?" && prompt.message.includes("unlisted.invalid:80"), "unlisted destination did not trigger a clear user approval prompt");
-          assert(!ctx.sessionManager.getBranch().some((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "unlisted.invalid"), "denied hostname was persisted to the session branch");
+          assert(prompt?.title === "Allow unlisted.invalid:80?" && prompt.message === "", "approval prompt asked for more than the detected hostname and port");
+          assert(!ctx.sessionManager.getBranch().some((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "unlisted.invalid" && entry.data?.port === 80), "denied hostname/port pair was persisted to the session branch");
         });
-        await record("approved proxy hostname is persisted to the active session branch", async () => {
+        await record("approved proxy hostname/port is persisted to the active session branch", async () => {
           approvalDecision = true;
           try {
             const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
@@ -481,9 +481,9 @@ export default function (pi: ExtensionAPI) {
             approvalDecision = false;
           }
           const prompt = approvalPrompts.at(-1);
-          assert(prompt?.message.includes("approved.invalid:80"), "approved destination prompt omitted hostname/port");
-          const approvals = ctx.sessionManager.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid");
-          assert(approvals.length === 1, `approval was not stored exactly once in the active session branch: ${approvals.length}`);
+          assert(prompt?.title === "Allow approved.invalid:80?" && prompt.message === "", "approval prompt asked for more than the detected hostname and port");
+          const approvals = ctx.sessionManager.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid" && entry.data?.port === 80);
+          assert(approvals.length === 1, `approval was not stored exactly once for approved.invalid:80 in the active session branch: ${approvals.length}`);
           assert(restartInnerSession, "test adapter could not replay session startup");
           const promptsBeforeRestore = approvalPrompts.length;
           await restartInnerSession();
@@ -494,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 
           const alternateBranchManager = new Proxy(currentTestContext.sessionManager, {
             get(target, property) {
-              if (property === "getBranch") return () => target.getBranch().filter((entry: any) => !(entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid"));
+              if (property === "getBranch") return () => target.getBranch().filter((entry: any) => !(entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "approved.invalid" && entry.data?.port === 80));
               const value = Reflect.get(target, property, target);
               return typeof value === "function" ? value.bind(target) : value;
             },
@@ -515,6 +515,14 @@ export default function (pi: ExtensionAPI) {
           await restartInnerSession();
           const branchRestored = await bash(retryCommand, process.cwd(), 10);
           assert(branchRestored.exit_code === 0 && branchRestored.output.trim().startsWith("HTTP/1.1 502"), `returning to the approved branch did not restore access: ${branchRestored.formattedOutput}`);
+
+          const promptsBeforeHttps = approvalPrompts.length;
+          const httpsCommand = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "CONNECT approved.invalid:443 HTTP/1.1\\r\\nHost: approved.invalid:443\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
+          const httpsDenied = await bash(httpsCommand, process.cwd(), 10);
+          assert(httpsDenied.exit_code === 0 && httpsDenied.output.trim().startsWith("HTTP/1.1 403"), `HTTP/80 approval incorrectly allowed HTTPS/443: ${httpsDenied.formattedOutput}`);
+          assert(approvalPrompts.length === promptsBeforeHttps + 1, "HTTPS/443 did not require its own approval");
+          const httpsPrompt = approvalPrompts.at(-1);
+          assert(httpsPrompt?.title === "Allow approved.invalid:443?" && httpsPrompt.message === "", "HTTPS prompt included anything beyond the detected hostname and port");
         });
         // Structured matches let callers consume results without reparsing prose.
         await record("search returns structured project matches", async () => {

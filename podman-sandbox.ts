@@ -226,6 +226,19 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "unknown";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["kiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit++;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
 function globToRegex(pattern: string): RegExp {
   // find returns every path; filtering here preserves Pi's familiar glob
   // interface without handing traversal to a host-side search process.
@@ -275,7 +288,7 @@ export default function (pi: ExtensionAPI) {
   // changes where its tools execute. Verbose traces avoid logging user commands.
   pi.registerFlag("sandbox-image", { description: "Podman image for sandbox tools", type: "string" });
   pi.registerFlag("sandbox-verbose", { description: "Log Podman sandbox startup and execution milestones", type: "boolean" });
-  pi.registerFlag("sandbox-egress-allow", { description: "Comma-separated exact DNS hostnames allowed through the bash HTTP proxy", type: "string" });
+  pi.registerFlag("sandbox-egress-allow", { description: "Comma-separated DNS destinations allowed through the bash proxy (hostname defaults to :443; use hostname:80 for HTTP)", type: "string" });
   const verbose = Boolean(pi.getFlag("sandbox-verbose")) || process.argv.includes("--verbose");
   const logVerbose = (message: string) => {
     if (verbose) process.stderr.write(`[podman-sandbox] ${message}\n`);
@@ -495,10 +508,12 @@ RUN apt-get update${install} \\
     for (const hostname of parseEgressAllowlist(String(pi.getFlag("sandbox-egress-allow") ?? ""))) egressAllowlist.add(hostname);
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== "sandbox-egress-allow") continue;
-      const data = entry.data as { hostname?: unknown } | undefined;
+      const data = entry.data as { hostname?: unknown; port?: unknown } | undefined;
       if (typeof data?.hostname !== "string") continue;
+      const port = data.port === undefined ? 443 : data.port;
+      if (typeof port !== "number" || (port !== 80 && port !== 443)) continue;
       try {
-        const restored = parseEgressAllowlist(data.hostname);
+        const restored = parseEgressAllowlist(`${data.hostname}:${port}`);
         if (restored.size === 1) egressAllowlist.add([...restored][0]);
       } catch {
         logVerbose("ignored invalid sandbox egress approval in session history");
@@ -507,37 +522,35 @@ RUN apt-get update${install} \\
   }
 
   async function requestEgressApproval(hostname: string, port: number, ctx: ExtensionContext): Promise<boolean> {
-    if (egressAllowlist.has(hostname)) return true;
-    const pending = pendingEgressApprovals.get(hostname);
+    const destination = `${hostname}:${port}`;
+    if (egressAllowlist.has(destination)) return true;
+    const pending = pendingEgressApprovals.get(destination);
     if (pending) return pending;
 
     const approval = (async () => {
       if (!ctx.hasUI || (port !== 80 && port !== 443)) return false;
       let normalized: string;
       try {
-        normalized = [...parseEgressAllowlist(hostname)][0];
+        normalized = [...parseEgressAllowlist(`${hostname}:${port}`)][0];
       } catch {
         return false;
       }
-      if (normalized !== hostname) return false;
+      if (normalized !== destination) return false;
       const approvalBranchLeaf = ctx.sessionManager.getLeafId();
-      const approved = await ctx.ui.confirm(
-        "Allow sandbox network destination?",
-        `The sandbox proxy denied ${hostname}:${port}. Allow this exact DNS hostname for HTTP (port 80) and HTTPS (port 443) in this session branch? The proxy will still reject private addresses and other ports.`,
-      );
+      const approved = await ctx.ui.confirm(`Allow ${destination}?`, "");
       if (!approved || ctx.sessionManager.getLeafId() !== approvalBranchLeaf) return false;
-      if (egressAllowlist.has(hostname)) return true;
-      pi.appendEntry("sandbox-egress-allow", { hostname });
-      egressAllowlist.add(hostname);
-      ctx.ui.notify(`Allowed ${hostname} through the sandbox proxy for this session branch`, "info");
-      logVerbose(`session branch approved proxy hostname ${hostname}`);
+      if (egressAllowlist.has(destination)) return true;
+      pi.appendEntry("sandbox-egress-allow", { hostname, port });
+      egressAllowlist.add(destination);
+      ctx.ui.notify(`Allowed ${destination} for this session branch`, "info");
+      logVerbose(`session branch approved proxy destination ${destination}`);
       return true;
     })();
-    pendingEgressApprovals.set(hostname, approval);
+    pendingEgressApprovals.set(destination, approval);
     try {
       return await approval;
     } finally {
-      if (pendingEgressApprovals.get(hostname) === approval) pendingEgressApprovals.delete(hostname);
+      if (pendingEgressApprovals.get(destination) === approval) pendingEgressApprovals.delete(destination);
     }
   }
 
@@ -655,6 +668,61 @@ RUN apt-get update${install} \\
     } finally {
       if (resetting === operation) resetting = undefined;
     }
+  }
+
+  async function sandboxContainerSize(): Promise<string> {
+    if (started) {
+      const inspected = await runPodman([
+        "container", "inspect", "--size", "--format", "{{.SizeRootFs}} {{.SizeRw}}", container,
+      ], { timeout: 30 });
+      const match = inspected.output.trim().match(/^(\d+)\s+(\d+)$/);
+      if (inspected.code === 0 && match) {
+        return `${formatBytes(Number(match[1]))} rootfs; ${formatBytes(Number(match[2]))} writable layer (project mount excluded)`;
+      }
+    }
+    const inspectedImage = await runPodman(["image", "inspect", "--format", "{{.Size}}", runtimeImage], { timeout: 30 });
+    const bytes = Number(inspectedImage.output.trim());
+    if (inspectedImage.code !== 0 || !Number.isFinite(bytes)) {
+      throw new Error(`could not inspect sandbox image size: ${inspectedImage.output.trim()}`);
+    }
+    return `${formatBytes(bytes)} image; container not started`;
+  }
+
+  async function sandboxTrafficStats() {
+    const stats = { http: 0, https: 0, denied: 0, bytesUp: 0, bytesDown: 0 };
+    if (!managedProxy) return stats;
+    const text = await fs.readFile(managedProxy.auditLogPath, "utf8").catch(() => "");
+    for (const line of text.split("\n").filter(Boolean)) {
+      try {
+        const record = JSON.parse(line);
+        if (record.method === "CONNECT") stats.https++;
+        else stats.http++;
+        if (!record.allowed) stats.denied++;
+        stats.bytesUp += Number(record.bytesUp) || 0;
+        stats.bytesDown += Number(record.bytesDown) || 0;
+      } catch {
+        // A partially appended final audit line is omitted until the next status refresh.
+      }
+    }
+    return stats;
+  }
+
+  async function sandboxStatsLines(verbose: boolean): Promise<string[]> {
+    await ensureImage();
+    packageState = await readPackageState();
+    const [containerSize, traffic] = await Promise.all([sandboxContainerSize(), sandboxTrafficStats()]);
+    const destinations = [...egressAllowlist].sort();
+    const lines = [
+      `Installed packages: ${packageState.packages.length}`,
+      `Allowed destinations: ${destinations.length}`,
+      `Pod container size: ${containerSize}`,
+      `Intercepted traffic: ${traffic.http} HTTP, ${traffic.https} HTTPS CONNECT; ${traffic.denied} denied; ${formatBytes(traffic.bytesUp)} up / ${formatBytes(traffic.bytesDown)} down`,
+    ];
+    if (verbose) {
+      lines.splice(1, 0, `  ${packageState.packages.length ? packageState.packages.join(", ") : "(none)"}`);
+      lines.splice(3, 0, `  ${destinations.length ? destinations.join(", ") : "(none)"}`);
+    }
+    return lines;
   }
 
   const readOps: ReadOperations = {
@@ -880,14 +948,14 @@ RUN apt-get update${install} \\
   pi.registerCommand("sandbox", {
     // Maintenance actions that can alter package state remain user initiated,
     // separate from the narrower model-callable additive package interface.
-    description: "Manage the Podman sandbox (refresh, upgrade, add, remove, list, reset)",
+    description: "Manage the Podman sandbox (status, list, refresh, upgrade, add, remove, reset)",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const operation = parts.shift();
+      const operation = parts.shift() ?? "status";
       const packageName = parts.shift();
       const needsPackage = operation === "add" || operation === "remove";
-      if (parts.length > 0 || !operation || (needsPackage && !packageName) || (!needsPackage && packageName)) {
-        ctx.ui.notify("Usage: /sandbox list|refresh|upgrade|add <package>|remove <package>|reset", "warning");
+      if (parts.length > 0 || (needsPackage && !packageName) || (!needsPackage && packageName)) {
+        ctx.ui.notify("Usage: /sandbox [status|list|refresh|upgrade|add <package>|remove <package>|reset]", "warning");
         return;
       }
       if (packageName && !/^[a-z0-9][a-z0-9+.-]*$/.test(packageName)) {
@@ -904,11 +972,28 @@ RUN apt-get update${install} \\
         return;
       }
       try {
+        if (operation === "status") {
+          const stats = await sandboxStatsLines(false);
+          ctx.ui.notify([
+            "Podman sandbox commands:",
+            "  /sandbox          show this help and quick stats",
+            "  /sandbox status   show this help and quick stats",
+            "  /sandbox list     show detailed package, destination, size, and traffic status",
+            "  /sandbox refresh  rebuild explicit packages from current repositories",
+            "  /sandbox upgrade  upgrade the project sandbox image",
+            "  /sandbox add <package>    add a Debian package",
+            "  /sandbox remove <package> remove an explicit package",
+            "  /sandbox reset    rebuild this project's sandbox from its base and package list",
+            "",
+            "Sandbox stats:",
+            ...stats,
+          ].join("\n"), "info");
+          return;
+        }
         if (operation === "list") {
           await ensureContainer();
-          packageState = await readPackageState();
-          const packageList = packageState.packages.length ? packageState.packages.join(", ") : "No explicitly added packages";
-          ctx.ui.notify(`list completed: ${packageList}`, "info");
+          const stats = await sandboxStatsLines(true);
+          ctx.ui.notify(`list completed:\n${stats.join("\n")}`, "info");
           return;
         }
         if (operation === "refresh") {

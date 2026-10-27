@@ -236,17 +236,17 @@ def main() -> int:
 
     process_env = os.environ.copy()
     host_canary = secrets.token_hex(16) if args.security else None
-    fixture_id = secrets.token_hex(8) if args.security else None
+    test_id = secrets.token_hex(8)
+    fixture_id = test_id if args.security else None
     security_outside = PROJECT_ROOT.parent / f".pi-sandbox-security-outside-{fixture_id}" if fixture_id else None
     security_tmp = Path(tempfile.gettempdir()) / f"pi-sandbox-security-tmp-{fixture_id}" if fixture_id else None
-    security_package_state = SCRATCH / f"package-state-{fixture_id}" if fixture_id else None
+    package_state_dir = SCRATCH / f"package-state-{test_id}"
     if host_canary:
         process_env["PI_SANDBOX_HOST_CANARY"] = host_canary
+    process_env["PI_SANDBOX_PACKAGE_PROJECT_ID"] = test_id
+    process_env["PI_SANDBOX_PACKAGE_STATE_DIR"] = str(package_state_dir)
     if fixture_id:
         process_env["PI_SANDBOX_FIXTURE_ID"] = fixture_id
-        process_env["PI_SANDBOX_PACKAGE_PROJECT_ID"] = fixture_id
-    if security_package_state:
-        process_env["PI_SANDBOX_PACKAGE_STATE_DIR"] = str(security_package_state)
     if security_outside and security_tmp:
         process_env["PI_SANDBOX_SECURITY_OUTSIDE"] = str(security_outside)
         process_env["PI_SANDBOX_SECURITY_TMP"] = str(security_tmp)
@@ -328,8 +328,22 @@ def main() -> int:
                     raise RuntimeError("expected final /sandbox reset to be handled")
                 rpc.wait_for_notice("reset completed", args.timeout)
         else:
-            rpc.wait_for_notice("list completed", args.timeout)
-            print("PASS: RPC loaded the extension, registered /sandbox, and completed /sandbox list in the Podman sandbox.")
+            list_notice = rpc.wait_for_notice("list completed:", args.timeout)
+            for expected in ("Installed packages:", "Allowed destinations:", "Pod container size:", "Intercepted traffic:"):
+                if expected not in list_notice:
+                    raise RuntimeError(f"/sandbox list omitted {expected!r}: {list_notice}")
+            print("PASS: RPC loaded the extension, registered /sandbox, and completed detailed /sandbox list status.")
+
+            status_id = "rpc-test-sandbox-status"
+            rpc.send({"id": status_id, "type": "prompt", "message": "/sandbox"})
+            status_response = rpc.wait_response(status_id, args.timeout)
+            if status_response.get("data", {}).get("disposition") != "handled":
+                raise RuntimeError("expected /sandbox status/help to be handled by the extension")
+            status_notice = rpc.wait_for_notice("Podman sandbox commands:", args.timeout)
+            for expected in ("Installed packages:", "Allowed destinations:", "Pod container size:", "Intercepted traffic:"):
+                if expected not in status_notice:
+                    raise RuntimeError(f"/sandbox status omitted {expected!r}: {status_notice}")
+            print("PASS: /sandbox showed command help and package, destination, container-size, and HTTP(S) traffic stats.")
 
             reset_id = "rpc-test-sandbox-reset"
             rpc.send({"id": reset_id, "type": "prompt", "message": "/sandbox reset"})
@@ -387,13 +401,13 @@ def main() -> int:
             shutil.rmtree(security_outside, ignore_errors=True)
         if security_tmp:
             shutil.rmtree(security_tmp, ignore_errors=True)
-        if security_package_state:
-            shutil.rmtree(security_package_state, ignore_errors=True)
-        if process is not None and fixture_id:
-            shutil.rmtree(PROJECT_ROOT / f"security-test-{process.pid}-{fixture_id}", ignore_errors=True)
+        shutil.rmtree(package_state_dir, ignore_errors=True)
+        if process is not None:
+            if fixture_id:
+                shutil.rmtree(PROJECT_ROOT / f"security-test-{process.pid}-{fixture_id}", ignore_errors=True)
             if not cleanup_test_containers(process.pid):
                 failed = True
-            if not cleanup_test_images(fixture_id):
+            if not cleanup_test_images(test_id):
                 failed = True
 
     stderr_contents = stderr_path.read_text(errors="replace") if stderr_path.exists() else ""

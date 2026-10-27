@@ -83,12 +83,23 @@ function normalizeHostname(hostname: string): string {
   return ascii;
 }
 
+function allowlistKey(hostname: string, port: number): string {
+  return `${hostname}:${port}`;
+}
+
 export function parseEgressAllowlist(raw: string): Set<string> {
-  const hosts = new Set<string>();
+  const destinations = new Set<string>();
   for (const value of raw.split(",").map((part) => part.trim()).filter(Boolean)) {
-    hosts.add(normalizeHostname(value));
+    const separator = value.lastIndexOf(":");
+    const hostnameText = separator >= 0 ? value.slice(0, separator) : value;
+    const portText = separator >= 0 ? value.slice(separator + 1) : "443";
+    if (hostnameText.includes(":") || !/^(?:80|443)$/.test(portText)) {
+      throw new Error("allowlist entries must be DNS hostnames with optional :80 or :443 ports");
+    }
+    const hostname = normalizeHostname(hostnameText);
+    destinations.add(allowlistKey(hostname, Number(portText)));
   }
-  return hosts;
+  return destinations;
 }
 
 function parseAuthority(authority: string, defaultPort: number): { hostname: string; port: number } {
@@ -130,9 +141,10 @@ async function resolveDestination(
   onDenied?: (hostname: string, port: number) => Promise<boolean>,
 ): Promise<Destination> {
   if (port !== 80 && port !== 443) throw new Error("proxy permits only ports 80 and 443");
-  if (!allowlist.has(hostname)) {
+  const key = allowlistKey(hostname, port);
+  if (!allowlist.has(key)) {
     const approved = await onDenied?.(hostname, port);
-    if (!approved || !allowlist.has(hostname)) throw new Error("destination hostname is not allowlisted");
+    if (!approved || !allowlist.has(key)) throw new Error("destination hostname and port are not allowlisted");
   }
   let addresses: ResolvedAddress[];
   try {

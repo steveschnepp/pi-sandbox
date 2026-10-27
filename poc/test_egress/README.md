@@ -24,13 +24,13 @@ The experiment binds host listeners on ephemeral ports and discovers `host.conta
 
 ## Production HTTP proxy checks
 
-`egress-proxy-test.mjs` imports the repository's production `egress-proxy.ts` and tests allowlist normalization, mandatory proxy authentication, rejection of non-allowlisted hostnames and IP literals, HTTP port policy, CONNECT rejection, and audit records. Rejected destinations are used deliberately, so the test makes no external network connection and requires no credentials or packages.
+`egress-proxy-test.mjs` imports the repository's production `egress-proxy.ts` and tests allowlist normalization (hostname defaults to HTTPS/443; `:80` opts into HTTP), mandatory proxy authentication, per-port rejection/approval of non-allowlisted destinations, IP literals, port policy, CONNECT rejection, and audit records. Rejected destinations use reserved `.invalid` names deliberately, so the test makes no external network connection and requires no credentials or packages.
 
 ```sh
 node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs
 ```
 
-A passing run prints `proxy allowlist, authentication, port policy, CONNECT rejection, and audit PoC passed`. The temporary proxy audit log is removed even when an assertion fails.
+A passing run prints `proxy allowlist, approval callback, authentication, port policy, CONNECT rejection, and audit PoC passed`. The temporary proxy audit log is removed even when an assertion fails.
 
 ## Findings
 
