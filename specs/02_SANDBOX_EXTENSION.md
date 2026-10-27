@@ -49,21 +49,65 @@ The extension is a local development containment boundary, not a complete hostil
 | Host callback | A Pi tool operation such as read/write that uses the Pi host process and Node filesystem APIs after a project-root check. |
 | Proxy audit record | A JSONL record written by the host-side proxy for an HTTP request or HTTPS CONNECT attempt, including policy decision and observed byte counters. |
 
-### Trust-boundary map
+### File-access boundary
 
 ```mermaid
-graph LR
-  Model[Pi model] --> Tools[Pi sandbox tool callbacks]
-  Tools -->|read/write/edit/ls with path guard| HostFS[Host project filesystem]
-  Tools -->|bash/find/search| Container[Rootless Podman container]
-  Container -->|project bind mount RW| HostFS
-  Container -->|ordinary mapped UID: proxy endpoint only| Proxy[Host managed HTTP proxy]
-  Proxy -->|approved DNS name and exact port| Internet[Public destination]
-  Container -->|UID 0 or Debian _apt UID 42| Direct[Direct network path allowed by nftables]
-  Pi[Pi extension process] -->|Podman CLI, image builds, audit and session state| Podman[Rootless Podman]
+flowchart TD
+  Model[Pi model] --> Dispatch[Pi tool dispatch]
+  Dispatch -->|read write edit ls| Guard[Host path guard]
+  Guard -->|allowed project path| HostFS[Node filesystem APIs]
+  HostFS --> Project[Host project tree]
+  Dispatch -->|bash find search| PodmanExec[Podman exec]
+  PodmanExec --> Command[Container command]
+  Command -->|single RW bind mount| ProjectMount[Same project path in container]
+  ProjectMount --- Project
+  Command -->|other container paths (read-only)| ReadOnly[Read-only container rootfs]
+  Command -->|temporary writes| Tmpfs[/tmp /var/tmp /run tmpfs]
 ```
 
-The model is not given a user or capability override for Bash. The extension process, user-only slash commands, Podman, host callbacks, package image builds, proxy, and other loaded extensions are separate trust surfaces.
+The guard checks canonical paths before host filesystem operations; it is not an atomic descriptor-based sandbox. The container gets the project mount and its own root filesystem, not arbitrary host paths. Pi `read`/`write`/`edit`/`ls` remain host-side capabilities and should not be confused with container operations.
+
+### UID and privilege boundary
+
+```mermaid
+flowchart TD
+  HostUser[Pi host UID:GID] -->|rootless Podman user namespace + keep-id| MappedIdentity[Mapped container UID:GID]
+  MappedIdentity -->|ordinary podman exec| Setpriv[setpriv clears inherited and ambient capabilities]
+  Setpriv --> BashUser[Bash runs as mapped UID:GID]
+  BashUser -->|NNP=1 prevents SUID/UID gain| SameIdentity[Real and effective IDs stay mapped]
+  Startup[Extension-owned firewall setup] -->|podman exec --user 0| NamespaceRoot[Container namespace root]
+  NamespaceRoot -->|NET_ADMIN during startup| FirewallSetup[nftables rules installed]
+  NamespaceRoot -.->|is not| HostRoot[Host root]
+```
+
+The container is created with all capabilities dropped except `NET_ADMIN`, which extension-owned startup uses to install nftables. The ordinary tool path explicitly runs as the mapped host UID/GID through `setpriv`; integration tests assert zero effective capabilities and `NoNewPrivs: 1`. `--userns=keep-id` keeps project file ownership aligned with the Pi user. Container UID 0 is namespace root, not host root. The direct-network exceptions for UID 0 and Debian `_apt` are shown in the network diagram below; ordinary Bash does not run as either identity.
+
+### Network-egress boundary
+
+```mermaid
+flowchart TD
+  Bash[Bash as mapped UID] --> Output{nftables OUTPUT chain}
+  Output -->|loopback or established traffic| Local[Accepted local/established traffic]
+  Output -->|destination is host proxy IP and port| Proxy[Authenticated host HTTP proxy]
+  Output -->|socket UID 0 or Debian _apt UID 42| DirectException[Direct egress exception]
+  Output -->|all other packets| Reject[Immediate admin-prohibited REJECT]
+
+  Proxy --> Auth{Proxy token valid?}
+  Auth -->|no| AuthDenied[407 authentication required]
+  Auth -->|yes| Pair{Exact hostname:port allowed?}
+  Pair -->|no| Ask{Interactive approval?}
+  Ask -->|declined or no UI| Denied[403 denied]
+  Ask -->|approved exact pair| Entry[Persist pair on active Pi session branch]
+  Entry --> Resolve[Resolve DNS at proxy]
+  Pair -->|yes| Resolve
+  Resolve --> Public{Public address available?}
+  Public -->|no or DNS failure| ResolveDenied[502 upstream resolution failure]
+  Public -->|yes| Pin[Connect to selected numeric IP]
+  Pin --> Transport[HTTP port 80 forward or HTTPS CONNECT port 443]
+```
+
+The nftables chain defaults to DROP and ends with an explicit REJECT after its accepts. For the mapped Bash identity, only the proxy endpoint is allowed directly; DNS and alternate ports cannot bypass the proxy. The proxy matches exact pairs: a bare CLI hostname means `:443`, while HTTP requires a separate `:80` entry. Approval prompts contain only the detected `hostname:port`; HTTPS payloads pass through encrypted and are not inspected. APT image builds use Podman's build networking and are separate from ordinary Bash egress.
+
 
 ## Architecture
 

@@ -1529,3 +1529,26 @@ Grounded the specification in the current extension, proxy, README, existing ima
 ### Next Steps
 
 - None for this documentation request. Keep future behavior changes synchronized with both the focused image-layer spec and this system-level contract.
+
+## Session 57: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Split Trust-Boundary Diagrams
+
+Replaced the single dense trust-boundary flowchart in `specs/02_SANDBOX_EXTENSION.md` with three focused diagrams: file access, UID/privilege mapping, and network egress. Each graph now shows one boundary and is followed by a short explanation of what its arrows do and do not mean. The lifecycle sequence diagram remains separate from these boundary maps.
+
+### What We Decided
+
+- Keep files, UID/privilege, and network as separate diagrams rather than scaling one graph, so the distinct mechanisms and exceptions are readable without zooming.
+- Label non-mounted container paths as read-only container-rootfs paths, not as arbitrary host paths.
+
+### Test Results / Benchmarks
+
+- Confirmed four Mermaid blocks exist, all local Markdown links resolve, text remains ASCII-7, and `git diff --check` passes.
+- No runtime code changed; runtime tests were not rerun.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | Splits the trust-boundary map into file, UID, and network diagrams. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the documentation refinement. |
