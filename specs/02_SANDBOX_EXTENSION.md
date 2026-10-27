@@ -71,16 +71,26 @@ The guard checks canonical paths before host filesystem operations; it is not an
 
 ```mermaid
 flowchart TD
-  HostUser[Pi host UID:GID] -->|rootless Podman user namespace + keep-id| MappedIdentity[Mapped container UID:GID]
-  MappedIdentity -->|ordinary podman exec| Setpriv[setpriv clears inherited and ambient capabilities]
-  Setpriv --> BashUser[Bash runs as mapped UID:GID]
-  BashUser -->|NNP=1 blocks setuid privilege gain| SameIdentity[Real and effective IDs stay mapped]
-  Startup[Extension-owned firewall setup] -->|podman exec --user 0| NamespaceRoot[Container namespace root]
-  NamespaceRoot -->|NET_ADMIN during startup| FirewallSetup[nftables rules installed]
-  NamespaceRoot -.->|is not| HostRoot[Host root]
+  subgraph BuildTime["Package image build time"]
+    Manifest[Project package manifest] --> PodmanBuild[Rootless podman build]
+    PodmanBuild --> BuildStage[Temporary image-build stage]
+    BuildStage --> AptRoot[apt-get install as build-stage UID 0]
+    AptRoot -->|network download helper| AptUser[_apt UID 42 in build stage]
+    BuildStage --> DerivedImage[Project-derived image]
+  end
+
+  subgraph Runtime["Long-running session container"]
+    HostUser[Pi host UID and GID] -->|rootless user namespace plus keep-id| MappedIdentity[Mapped container UID and GID]
+    MappedIdentity -->|ordinary podman exec| Setpriv[setpriv clears inherited and ambient capabilities]
+    Setpriv --> BashUser[Bash runs as mapped UID and GID]
+    BashUser -->|NNP 1 blocks setuid privilege gain| SameIdentity[Real and effective IDs stay mapped]
+    Startup[Extension-owned firewall setup] -->|podman exec as UID 0| NamespaceRoot[Container namespace root]
+    NamespaceRoot -->|NET_ADMIN during startup| FirewallSetup[nftables rules installed]
+    NamespaceRoot -.->|is not| HostRoot[Host root]
+  end
 ```
 
-The container is created with all capabilities dropped except `NET_ADMIN`, which extension-owned startup uses to install nftables. The ordinary tool path explicitly runs as the mapped host UID/GID through `setpriv`; integration tests assert zero effective capabilities and `NoNewPrivs: 1`. `--userns=keep-id` keeps project file ownership aligned with the Pi user. Container UID 0 is namespace root, not host root. The direct-network exceptions for UID 0 and Debian `_apt` are shown in the network diagram below; ordinary Bash does not run as either identity.
+The package manifest is consumed by rootless Podman's image-build path, not mounted into the long-running session container. `apt-get` installs as UID 0 inside the temporary build stage and uses Debian `_apt` UID 42 as its network-download helper; that traffic uses Podman build networking, not the session container's nftables chain. The session container is created with all capabilities dropped except `NET_ADMIN`, which extension-owned startup uses to install nftables. The ordinary tool path explicitly runs as the mapped host UID/GID through `setpriv`; integration tests assert zero effective capabilities and `NoNewPrivs: 1`. `--userns=keep-id` keeps project file ownership aligned with the Pi user. Container UID 0 is namespace root, not host root. The runtime firewall still has direct-egress accepts for socket UIDs 0 and 42, but ordinary Bash runs as neither identity and package installation does not execute in this container.
 
 ### Network-egress boundary
 

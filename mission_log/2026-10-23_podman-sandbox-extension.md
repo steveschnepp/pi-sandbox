@@ -1590,3 +1590,25 @@ GitHub reported a second lexical error in the file-access Mermaid diagram at the
 |------|---------|
 | `specs/02_SANDBOX_EXTENSION.md` | Removes parser-sensitive slash-prefixed display text from the trust-boundary graph. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the rendering follow-up. |
+
+## Session 60: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - APT Identity in UID Diagram
+
+Expanded the UID/privilege diagram in `specs/02_SANDBOX_EXTENSION.md` to show package image builds alongside the long-running container. It now distinguishes the host Pi UID invoking rootless `podman build`, build-stage UID 0 running `apt-get`, the `_apt` UID 42 download helper, and the separate mapped-UID Bash and namespace-root firewall-startup paths. Clarified that APT build traffic uses Podman build networking and does not traverse the session container's nftables chain, even though the runtime chain retains UID 0 and UID 42 direct-egress accepts.
+
+### What We Decided
+
+- Keep build-time package identities in the UID diagram but separate them visually from runtime session identities; otherwise the `_apt` firewall exception could imply that APT installs run in the Bash container.
+
+### Test Results / Benchmarks
+
+- `git diff --check`: passed.
+- No runtime code changed; runtime tests were not rerun.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | Adds rootless APT build, UID 0, `_apt` UID 42, and separation from runtime identity to the privilege diagram. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the diagram clarification. |
