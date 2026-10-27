@@ -1,0 +1,6 @@
+ARG BASE_IMAGE=debian:stable-slim
+FROM ${BASE_IMAGE}
+
+COPY suid-probe /usr/local/bin/suid-probe
+RUN chown root:root /usr/local/bin/suid-probe \
+    && chmod 4755 /usr/local/bin/suid-probe

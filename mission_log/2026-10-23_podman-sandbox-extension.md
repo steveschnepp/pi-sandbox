@@ -873,3 +873,158 @@ Built a disposable image from the already-local sandbox image with a tiny root-o
 - SUID control image without NNP: `ruid=1000 euid=0` (expected privilege transition).
 - Same test image with extension-equivalent capabilities and NNP via `podman exec`: `ruid=1000 euid=1000` (transition blocked).
 - Temporary container and image are removed after the experiment; no helper binary or production image changes were needed.
+
+## Session 39: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - POC Directory Layout
+
+The user clarified that each retained experiment belongs directly under a named test directory in `poc/` (for example, `poc/test_setuid/...`, `poc/test_egress/...`), not under a project-name nesting layer. Preserve runnable setup/source and concise findings for the SUID and rootless-egress PoCs; keep the existing Bash output regression inside the established security suite rather than duplicating it.
+
+## Session 40: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - POC Retention Handoff
+
+The user requested that experiments be retained as committed artifacts in test-named directories directly under `poc/` (for example, `poc/test_setuid/...`, not `poc/<project>/...`) and asked to open a new session. Created the first artifact, `poc/test_setuid/suid-probe.c`, which prints real/effective UIDs for the setuid PoC. The four bisectable implementation/documentation commits are already on `master`: package purge, Bash output/egress hardening, Apache-2.0 license, and documentation/mission-log updates. Unrelated untracked root files `Makefile`, `fibo.c`, and `test_fibo.sh` remain untouched.
+
+### Current State
+
+- The SUID PoC was proven with a disposable image: without NNP the probe reported `ruid=1000 euid=0`; with the extension's NNP/capability posture through `podman exec`, it reported `ruid=1000 euid=1000`.
+- The egress nftables PoC source is still temporarily at `scratch/egress-netfilter-poc.py`; its results are recorded above. It needs a retained copy under `poc/test_egress/`.
+- The production proxy unit test was run from a temporary scratch script, which has been removed. Retain it under `poc/test_egress/` too.
+- The existing Bash output regression is already in `poc/podman-sandbox-security-test.ts`; link to it rather than duplicating it.
+- No full RPC suite was run after adding nftables to the image recipe because doing so would execute a package installation during image build.
+
+### Next Steps
+
+- Complete `poc/test_setuid/` with a Containerfile, runnable script, and README that reproduce both NNP control and blocked cases without package installation.
+- Create `poc/test_egress/` with the rootless nftables PoC, proxy-unit test, and instructions; add a concise `poc/README.md` linking these and existing tests.
+- Preserve the no-DoS scope: no bandwidth or connection-rate limits.
+- Link the retained artifacts from the next append-only mission-log session, run syntax/static checks and the PoCs where possible, then commit only the specific POC files and index. Do not stage the unrelated root files.
+
+## Session 41: Podman Sandbox Extension (2026-10-27)
+
+## What We Did
+
+Started organizing the retained security experiments into `poc/test_setuid/` and `poc/test_egress/`, with a top-level `poc/README.md`. Added the SUID PoC's `Containerfile`, host-compile/run script, and README. Added an egress README and a dependency-free Node test that imports the production proxy and checks hostname normalization, proxy authentication, denied host/IP/port requests, CONNECT rejection, and audit records. The first proxy-test run exposed a mismatched expected error string in the test itself; corrected it to match the production HTTP port-policy response, then the test passed.
+
+Ran the SUID PoC successfully: the no-NNP control reported `ruid=1000 euid=0`, while the extension-equivalent `no-new-privileges` case reported `ruid=1000 euid=1000`. The proxy test also passed. A run of the retained nftables PoC exceeded its 30-second subprocess timeout and left its disposable container running; removed that exact container. Further diagnosis and cleanup robustness are still needed before claiming this PoC passes in the current environment.
+
+## What We Learned
+
+### Technical
+
+- The SUID transition can be reproduced using a host-compiled probe copied into a disposable image; no image package installation is required.
+- Proxy rejection tests can avoid external network access by targeting disallowed names and ports, while still exercising the production handler and audit log.
+- Python's `subprocess.run(..., timeout=...)` killed the local Podman client but did not remove the running container in this timeout case. The PoC needs explicit named-container cleanup on both success and failure.
+
+### Process
+
+- A test's expected error text is part of the contract; asserting the wrong message can fail a healthy production behavior. Correct the assertion only after checking the actual response.
+
+## What We Decided
+
+- Keep the SUID setup reproducible from committed C source and Containerfile, compiling into a temporary build context rather than checking in a binary.
+- Keep production proxy checks separate from the larger RPC security suite, and use deterministic rejection paths rather than relying on public DNS/upstream availability.
+- Make container cleanup explicit in the egress PoC before considering the retained artifact complete.
+
+## What We'd Do Differently
+
+- Give the nftables runner a unique explicit container name and cleanup path before relying on `--rm`; an external timeout can terminate Podman before its normal cleanup occurs.
+- Add progress diagnostics around the container's firewall/network steps so a future hang identifies the blocked operation.
+
+## Files Changed
+
+| File | Purpose |
+|------|---------|
+| `poc/README.md` | Entry point linking retained sandbox experiments. |
+| `poc/test_setuid/Containerfile` | Builds the probe image without installing packages. |
+| `poc/test_setuid/run.sh` | Compiles the probe, runs control and NNP cases, and cleans temporary artifacts. |
+| `poc/test_setuid/README.md` | Documents reproduction and observed SUID result. |
+| `poc/test_egress/README.md` | Documents the firewall and production proxy experiments. |
+| `poc/test_egress/egress-proxy-test.mjs` | Deterministic checks of proxy policy and audit behavior. |
+| `poc/test_egress/egress-netfilter-poc.py` | Retained rootless nftables experiment; current run timed out and is under diagnosis. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this checkpoint without modifying earlier log bytes. |
+
+## Test Results / Benchmarks
+
+- `bash -n poc/test_setuid/run.sh`: passed.
+- `./poc/test_setuid/run.sh`: passed, control `ruid=1000 euid=0`; NNP `ruid=1000 euid=1000`.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed after correcting an assertion's expected HTTP error text.
+- `python3 -B` AST parse of the nftables runner and `git diff --check`: passed.
+- `./poc/test_egress/egress-netfilter-poc.py localhost/pi-sandbox:9f04667f1b909291`: timed out after 30 seconds; the exact test-created container was explicitly removed afterward. Do not treat this run as a pass.
+
+## Next Steps
+
+- Make the nftables runner reliably clean up on timeout and add enough diagnostics to identify its hang.
+- Run the retained egress experiments and static checks, inspect the final diff, then commit only the POC directories/index and the mission-log update; leave unrelated root files untouched.
+
+## Session 42: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Hardened `poc/test_egress/egress-netfilter-poc.py` with a unique named container, explicit forced removal on subprocess timeout, and shell tracing captured in its diagnostics. The second diagnostic run localized the hang to the intentionally blocked TCP probe: GNU `timeout` could not signal the child after it changed to mapped UID 1000 because the disposable test container had dropped `CAP_KILL`. Added only `CAP_KILL` to this test container and a `--kill-after` grace period to the blocked-probe timeout. The PoC then passed: the mapped user reached the allowed proxy receiver, direct access remained blocked, and container root plus UID 42 reached their test receivers. The test container was removed normally.
+
+The retained setuid PoC and production proxy test also passed in the current environment. The top-level POC index and focused READMEs describe the retained artifacts and distinguish the existing Bash output checks in the main RPC security adapter rather than duplicating them.
+
+### What We Learned
+
+#### Technical
+
+- When the test process changes UID before attempting a blocked TCP connect, a root `timeout` process needs `CAP_KILL` to terminate that lower-UID child. Without it, the command can hang despite the timeout interval expiring.
+- Adding `CAP_KILL` to the disposable measurement container is a harness requirement only; the extension's ordinary-command capability policy remains unchanged.
+- On timeout, killing the Podman client alone did not remove the running container. Naming the test container and explicitly invoking `podman rm --force` made failure cleanup reliable.
+
+#### Process
+
+- Capture command-level tracing and preserve timeout stdout/stderr so a test failure points at the stalled phase instead of appearing as an unexplained outer timeout.
+
+### What We Decided
+
+- Keep the nftables experiment bounded and self-cleaning with a named disposable container and an explicit timeout cleanup path.
+- Preserve the no-package-install setup for both egress and SUID experiments.
+- Keep the historical Bash output regression linked from the POC index; its detailed tests remain in `poc/podman-sandbox-security-test.ts`.
+
+### Test Results / Benchmarks
+
+- `./poc/test_egress/egress-netfilter-poc.py localhost/pi-sandbox:9f04667f1b909291`: passed. Proxy receiver got `proxy-user`; blocked direct receiver got no data; root and UID 42 receivers got their expected messages. Temporary container exited 0.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed allowlist normalization, authentication, host/IP/port rejection, CONNECT rejection, and audit assertions.
+- `./poc/test_setuid/run.sh`: passed (`ruid=1000 euid=0` without NNP; `ruid=1000 euid=1000` with NNP).
+- `bash -n poc/test_setuid/run.sh`, Python AST parsing, and `git diff --check`: passed at the corresponding checkpoints.
+
+### Next Steps
+
+- Run the complete final checks, mission-log lint, inspect the exact staged diff, and commit only retained POC artifacts plus the mission-log update. Keep unrelated root-level `Makefile`, `fibo.c`, and `test_fibo.sh` unstaged.
+
+## Session 43: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Completed the retained POC layout under `poc/test_setuid/` and `poc/test_egress/`, and added the `poc/README.md` entry point. The setuid script compiles into a temporary context, builds without package installation, verifies both the SUID control and no-new-privileges result, and removes its disposable image. The egress nftables runner now names its container, removes it on timeout, and grants `CAP_KILL` only to its disposable test container so the blocked lower-UID TCP probe can be terminated. The deterministic proxy test imports the production TypeScript module and cleans its audit log. The index points to existing Bash output coverage in the main security suite instead of duplicating it.
+
+Reviewed the retained files, confirmed the only remaining Podman containers are the pre-existing sandbox/base containers, and verified the focused test directories contain only source, setup, scripts, and documentation. Unrelated root-level `Makefile`, `fibo.c`, and `test_fibo.sh` remain outside the intended commit.
+
+### What We Learned
+
+- A tiny host-compiled C probe and a generated temporary image context retain the SUID experiment without checking in architecture-specific binaries or installing packages.
+- The nftables test's prior timeout was caused by missing `CAP_KILL` in its harness, not a changed production policy. Explicit container naming and timeout cleanup also prevent that diagnostic path from leaking a test container.
+- Keeping retained experiments grouped in directly named `poc/test_*` directories makes setup, findings, and reproduction instructions discoverable while preserving the larger RPC suite as the integration entry point.
+
+### What We Decided
+
+- Retain both focused security PoCs and the dependency-free proxy-policy test as committed artifacts.
+- Keep the Bash output regression in `poc/podman-sandbox-security-test.ts`; link it from `poc/README.md` rather than creating overlapping standalone coverage.
+- Stage only `poc/README.md`, the two POC directories, and this mission-log update. Do not include unrelated root files.
+
+### Test Results / Benchmarks
+
+- `./poc/test_setuid/run.sh`: passed; control `ruid=1000 euid=0`, no-new-privileges `ruid=1000 euid=1000`.
+- `python3 -B poc/test_egress/egress-netfilter-poc.py localhost/pi-sandbox:9f04667f1b909291`: passed; permitted receiver got `proxy-user`, direct receiver got no data, root and UID 42 receivers got their expected messages, and the disposable container exited 0.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed authentication, allowlist, IP/port rejection, CONNECT rejection, and audit assertions.
+- `bash -n poc/test_setuid/run.sh`: passed.
+- Python AST parse of `egress-netfilter-poc.py`: passed without creating bytecode.
+- `git diff --check`: passed.
+- Mission-log lint: passed with zero errors.
+
+### Next Steps
+
+- Stage the exact retained POC files and mission-log update, inspect the staged diff, and commit the retained artifacts. Preserve the unrelated untracked root files.
