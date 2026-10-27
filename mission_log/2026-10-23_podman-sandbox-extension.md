@@ -1491,3 +1491,41 @@ Added an end-to-end proxy assertion that a bare allowlist hostname permits CONNE
 |------|---------|
 | `poc/test_egress/egress-proxy-test.mjs` | Explicitly verifies bare-host HTTPS/443 reaches DNS resolution while unlisted HTTP/80 is rejected. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records final default-HTTPS verification. |
+
+## Session 56: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Comprehensive System Specification
+
+Created `specs/02_SANDBOX_EXTENSION.md` as the system-level specification for the implemented Pi Podman sandbox. It consolidates the tool and host-callback boundaries, rootless container lifecycle, package/image state, per-port proxy policy and branch approvals, Bash output capture, `/sandbox` status and maintenance commands, test strategy, failure behavior, and explicit security limitations. It links to `01_SANDBOX_IMAGE_LAYERS.md` for the package/image sub-design rather than replacing or duplicating that focused spec. Added the new document to `specs/README.md`.
+
+Grounded the specification in the current extension, proxy, README, existing image-layer spec, RPC/security tests, and retained PoC documentation. The self-review confirmed all required spec sections, local Markdown links, ASCII-7 text, and `git diff --check`.
+
+### What We Learned
+
+- The existing `01_SANDBOX_IMAGE_LAYERS.md` covers the package/image architecture but not the full Pi-facing surface, host file callbacks, proxy approvals, status, output, or security threat model; a separate system spec is useful.
+- Comprehensive documentation must distinguish tested boundaries from stronger claims: host file callbacks remain host-side, and termination of the Podman client does not guarantee every backend stops an already-started container exec.
+
+### What We Decided
+
+- Keep `01_SANDBOX_IMAGE_LAYERS.md` as the focused image/package spec and make `02_SANDBOX_EXTENSION.md` the system-level contract.
+- Document the implementation as it exists, including known risks and unanswered operational questions, rather than presenting aspirational guarantees as current behavior.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | New comprehensive architecture and behavior contract for the Pi Podman sandbox extension. |
+| `specs/README.md` | Adds the system-level specification to the index. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the documentation work. |
+
+### Test Results / Benchmarks
+
+- Required spec headings: present.
+- Relative Markdown links: all resolve.
+- ASCII-7 check: passed.
+- `git diff --check`: passed.
+- No runtime code changed; no runtime test rerun was required.
+
+### Next Steps
+
+- None for this documentation request. Keep future behavior changes synchronized with both the focused image-layer spec and this system-level contract.
