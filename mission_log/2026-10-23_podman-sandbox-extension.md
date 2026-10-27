@@ -601,3 +601,275 @@ Reviewed documentation references for stale harness counts and descriptions. His
 |------|---------|
 | `README.md` | Separates host-side file callback capabilities from the container boundary and clarifies security-test scope. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended this documentation clarification. |
+
+## Session 15: Podman Sandbox Extension (2026-10-26)
+
+### What We Did
+
+Added concise README instructions for running the extension from another project. The project-local option copies `podman-sandbox.ts` into `<project>/.pi/extensions/`; the global option copies it into `~/.pi/agent/extensions/`. The note explains project trust for local extensions and that a global install replaces the standard coding tools in every project. Kept the instructions to direct copy-and-run commands rather than adding package or linking workflows.
+
+### What We Decided
+
+- Document the two requested supported locations: project `.pi/extensions` and user `~/.pi/agent/extensions`.
+- Keep this a minimal local installation guide; no package publication or extension symlink workflow is needed.
+
+### Test Results / Benchmarks
+
+- `git diff --check`: passed.
+- Pi extension, configuration, settings, package, and project-trust documentation reviewed for the documented locations and trust behavior.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Adds concise project-local and global installation steps for using the extension from other projects. |
+
+## Session 16: Podman Sandbox Extension (2026-10-26)
+
+### What We Did
+
+Changed the README's project-local and global installation examples from copying `podman-sandbox.ts` to creating symbolic links. The instructions now state that the link target should be the absolute path to the checkout and explain the tradeoff: source updates are picked up on the next Pi start, but moving or removing the checkout breaks the link.
+
+Checked Pi's extension discovery implementation: direct `.ts` entries in local and agent extension directories are discovered when the directory entry is a symbolic link, so these install examples use Pi's supported discovery path.
+
+### What We Decided
+
+- Prefer `ln -s` over `cp` in the install instructions so the installed extension follows the working checkout without repeated copies.
+- Use an absolute symlink target to avoid resolution relative to the destination extension directory.
+
+### Test Results / Benchmarks
+
+- Pi extension documentation and loader discovery behavior were checked for direct symlinked extension entries.
+- `git diff --check`: passed.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Uses local/global symlink installation instructions and explains the difference from copying. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Appended the symlink-install decision and verification. |
+
+## Session 17: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided
+
+- Keep Pi's `createBashTool` output accumulator, but redirect each sandbox bash command's stdout and stderr inside the container to unique `/tmp/session-<session-id>-<tool-call-id>.out` and `.err` files. Return only a compact summary with both absolute paths and newline counts, so large command output does not enter the current model context and remains inspectable by later sandbox commands.
+- Keep the files in the session container's `/tmp` rather than the mounted project, avoiding generated output artifacts in the checkout; container teardown already removes them.
+
+## Session 18: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Correction
+
+The previous session note misread the requested boundary and placed output files inside the container. The redirect must happen on the host when the extension launches `podman exec`: stdout and stderr go directly to host-side files named `session-<session-id>-<tool-call-id>.out` and `.err`, and only a compact summary with the host paths and line counts is emitted into the Pi tool result. This preserves the full output outside Podman and keeps it out of the current session context.
+
+## Session 19: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Implemented the clarified host-side redirect without wrapping or rewriting the user's shell command. `runPodman()` opens two mode-0600 files under the host temporary directory and passes their file descriptors as the spawned Podman process's stdout and stderr. Bash operations use `session-<sanitized-Pi-session-id>-<monotonic-command-id>.out/.err`; after Podman exits, the extension counts newline bytes and streams only `[stdout: <path> <n> lines | stderr: <path> <n> lines]` to Pi. The existing `createBashTool` factory remains responsible for the standard tool contract. README documentation describes the host-only files. Added a security-suite scenario that emits 4,530 lines on each stream and will verify both host files and the compact result.
+
+Initial static checks passed: the extension loader's help path, Python AST parsing for the runner, and `git diff --check`. The end-to-end test is pending.
+
+### What We Decided
+
+- Redirect at process launch using host file descriptors; do not construct a shell wrapper or redirect inside Podman.
+- Use Pi's session ID plus an extension-local monotonic command ID for unique output filenames. These files stay in host temporary storage rather than appearing in the project or container.
+
+## Session 20: Podman Sandbox Extension (2026-10-27)
+
+### Test Results / Benchmarks
+
+- `pi -ne -e ./podman-sandbox.ts --help`: passed; Pi loaded the extension after the implementation edits.
+- `python3 -B` AST parse for `poc/test-podman-sandbox-rpc.py`: passed.
+- `git diff --check`: passed.
+- Mission-log lint: passed before this test-result append.
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 120`: blocked before the suite ran. Pi loaded the extension and registered the test command, but startup reported `Podman must be configured for rootless operation`; this environment currently reports rootless=false. The new 4,530-line redirect assertion therefore remains unexecuted here.
+
+### Next Steps
+
+- Re-run the security suite in a rootless Podman environment to verify that the host files contain separate complete streams while only the path/count summary reaches the tool result.
+
+## Session 21: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Output Preview Refinement
+
+The user requested a useful bounded preview rather than a summary-only response: show the first 128 lines of each non-empty stream; when a stream is longer, append a marker with its full host file path and total line count; always finish with `[exit code = <code>]`. Omit the `[stdout]` or `[stderr]` section when that stream is empty. Line counts are computed in-app by streaming each host file and counting LF bytes (the same convention as `wc -l`), avoiding a separate host subprocess. The first 128 lines are read from the host file after Podman exits.
+
+## Session 22: Podman Sandbox Extension (2026-10-27)
+
+### What We Learned - First Formatted-Output Run
+
+The standalone Pi invocation now starts the sandbox successfully. The first security-suite run reached the tests but returned 32/37: five assertions still expected bare stdout from the previous Bash tool contract, and the new preview assertion exposed that the initial formatter used literal backslash-n characters rather than newline characters. The redirect files were created, contained the full separate streams, and the tool result showed the 128-line previews and full-file markers; test parsing and newline formatting needed correction. These failures were in the formatter/test contract, not evidence of a Podman boundary escape.
+
+### What We Decided
+
+- Parse the new structured Bash display in the security adapter so existing assertions continue testing command stdout and stderr rather than presentation headers.
+- Use a session-prefixed epoch-millisecond command ID, with a process-local monotonic guard for same-millisecond calls, to avoid rewindable command history and reduce collisions after extension reloads.
+
+## Session 23: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Corrected the formatted output to use actual newlines, changed the security adapter to extract stdout/stderr from the new result format, and omitted headers for empty streams. Switched command IDs to epoch milliseconds with a process-local monotonic guard, retaining the unique session ID prefix. Output files are created exclusively; a collision surfaces as a tool error, so a model retry gets a later command ID.
+
+Re-ran the security suite successfully. It verifies the first 128 lines of both streams, full host-file contents and line-count markers for 4,530-line streams, empty-output formatting, and preservation of exit code 213. Also ran standalone `pi -e podman-sandbox.ts -p "use the bash tool to get the current date"`; the invocation succeeded. Removed the unintended `current-date.txt` fixture created by that prompt.
+
+### What We Learned
+
+- The first formatted-output test attempt failed because the adapter still expected plain stdout, and the formatter initially emitted literal `\\n` characters. Testing through real Pi RPC surfaced both presentation-contract issues; adapting the helper and using actual newline characters fixed them.
+- Streaming the host output files in-app counts LF bytes with bounded memory and avoids starting `wc` for every bash command.
+- A session UUID plus epoch-millisecond command number is sufficient under the assumption that concurrent Pi processes do not share a session ID. The monotonic guard handles multiple commands occurring in the same millisecond within one runtime; exclusive file creation leaves any unexpected collision visible for retry.
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 120`: passed, 37/37 checks, including the new 128-line preview, full-output files, empty stream headers, and nonzero exit-code coverage.
+- `pi -e podman-sandbox.ts -p "use the bash tool to get the current date"`: passed; standalone Pi returned the date.
+- Extension help load, `git diff --check`, and mission-log lint: passed.
+
+## Session 24: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Temporary File Retention
+
+The user clarified that output files should not remain when a stream is fully inlined (128 lines or fewer). After counting and collecting the preview, the extension now removes each small or empty stream's host temp file; files longer than 128 lines remain and their paths are shown. A create-exclusive collision stays a tool error, allowing the model to retry with the next session-prefixed epoch-millisecond command ID. Added a security assertion for inline stdout/stderr and host-file cleanup.
+
+## Session 25: Podman Sandbox Extension (2026-10-27)
+
+### Test Results / Benchmarks
+
+- `./poc/test-podman-sandbox-rpc.py --security --timeout 120`: passed, 38/38 checks, including inlining and deletion of small stdout/stderr files, omission of empty sections, retention and previews for 4,530-line streams, and exit code 213.
+- `git diff --check`: passed.
+- Mission-log lint: passed before this test-result append.
+
+## Session 26: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Package Removal Semantics
+
+For `/sandbox remove <package>`, use scripted `apt-get` commands only: purge the requested package and then run `apt-get autoremove --purge -y` to purge automatically installed dependencies that became unused. Keep explicit-package tracking removal after both APT steps succeed, so failures do not falsely report the package as removed.
+
+## Session 27: Podman Sandbox Extension (2026-10-27)
+
+### What We Did
+
+Updated the user-controlled `/sandbox remove` operation from `apt-get remove` to `apt-get purge`, followed by `apt-get autoremove --purge -y`. The explicit-package tracking list is edited only after both APT operations succeed. Updated the README to document the purge and automatic cleanup behavior. Used the scripted `apt-get` frontend, not `apt`.
+
+### Test Results / Benchmarks
+
+- `pi -ne -e ./podman-sandbox.ts --help`: passed; Pi loaded the extension after the command change.
+- `git diff --check`: passed.
+- Mission-log lint: passed before this test-result append.
+
+### Next Steps
+
+- Exercise `/sandbox remove` against a disposable installed package in a rootless sandbox when package-removal integration coverage is needed.
+
+## Session 28: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Default Python Runtime
+
+The embedded Debian image already installs `git`. Add `python3` and `python-is-python3` to its default package list so both `python3` and the familiar `python` command are available. Because the image tag hashes the Dockerfile, this changes the tag and causes the extension to build the updated default image on next startup.
+
+## Session 29: Podman Sandbox Extension (2026-10-27)
+
+### Test Results / Benchmarks
+
+- `pi -ne -e ./podman-sandbox.ts --help`: passed; extension parsed after the embedded package-list change.
+- `git diff --check`: passed.
+- Mission-log lint: passed before this test-result append.
+- Did not build the updated image in this step; the Dockerfile-hash tag changes, so the next normal startup will build it and install the added Debian packages.
+
+## Session 30: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Split Egress Policy
+
+The user clarified the intended policy: the fixed, validated `sandbox` package-management operations retain network access, while ordinary bash has no direct egress and can reach external destinations only through an extension-managed HTTP proxy. Proxy destinations should be user-configurable and monitored. HTTPS monitoring means recording CONNECT destination and connection/byte metadata; inspecting encrypted request contents would require TLS interception and is not part of the default proposal. Direct egress must be blocked at the network layer, not merely by injecting `HTTP_PROXY`, so a rootless Podman proof-of-enforcement is required before implementation.
+
+## Session 31: Podman Sandbox Extension (2026-10-27)
+
+### What We Learned - Rootless Egress Enforcement PoC
+
+Inspected the current Podman runtime: rootless Podman 5.4.2 uses Netavark with Pasta networking. A disposable container with `CAP_NET_ADMIN` could create an nftables OUTPUT chain with a default-drop policy. A controlled TCP receiver experiment then proved the key split in this environment: a mapped UID 1000 process reached only the explicitly allowed host-gateway IP/port, and its attempt to reach a second receiver port was blocked; a container-root process retained direct egress. With `--no-new-privileges` and `setpriv --bounding-set=-net_admin --inh-caps=-all --ambient-caps=-all`, a package-style root child could not flush the nftables ruleset while retaining the root egress exception.
+
+The first experiment attempts failed because the host `nft` executable needed host shared libraries mounted into the disposable container, and a keep-id container launched as the mapped user could not change UID/GID. Running the test as container UID 0 and dropping only to UID 1000 for the ordinary-command probes resolved this. No host firewall state was changed; each ruleset existed only in a disposable container network namespace.
+
+### What We'd Do Differently
+
+- Run the temporary container as namespace root from the first firewall capability test; keep-id defaults to the mapped user and cannot perform arbitrary setgroups/reuid transitions.
+- Include the nft binary's dynamic libraries when borrowing the host tool for a no-install PoC, or add the nftables package to the eventual embedded image once implementation is approved.
+
+### Test Results / Benchmarks
+
+- Rootless nftables OUTPUT default-drop chain creation: passed in a disposable Podman network namespace.
+- UID-filtered network test: mapped UID reached only the allowed host-gateway listener; direct listener access was blocked. Container root reached the direct listener.
+- Firewall tamper check: root command with `CAP_NET_ADMIN` removed could not flush the nftables ruleset.
+
+### Next Steps
+
+- Implement the managed HTTP proxy and user-owned allowlist, install the nftables enforcement rules before sandbox tools are considered ready, and ensure ordinary bash cannot bypass the proxy while package-manager execs retain their narrow network exception.
+- Verify `_apt` helper traffic, IPv6 behavior, proxy CONNECT policy/logging, and direct-IP/alternate-port bypass attempts in the production integration suite.
+
+## Session 32: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - DNS-Based Proxy Allowlist
+
+The user clarified that ordinary bash destinations must be allowed by DNS hostname, not by container-side IP rules. The HTTP proxy is therefore the only permitted egress path for bash; its configurable allowlist matches hostnames and it may tunnel HTTPS with CONNECT. The nftables layer only needs to permit the proxy endpoint and deny every direct destination; the proxy resolves and validates the requested hostname, pins a validated address for the connection, and logs destination/port and transfer metadata without decrypting TLS.
+
+## Session 33: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Apache License
+
+Applied the project's chosen Apache License 2.0 by adding the canonical license text as `LICENSE` and documenting the license in `README.md`. Used the standard text without guessing a copyright-holder identity; a copyright notice can be added once the owner name/year is specified.
+
+## Session 34: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Egress Scope
+
+The user explicitly deprioritized denial-of-service protection. Keep this change focused on preventing unwanted access: block direct bash egress, permit only the authenticated proxy path, and enforce the DNS-host allowlist there. Do not add bandwidth quotas, connection-rate limits, or unrelated DoS controls in this phase.
+
+## Session 35: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - DNS-Allowlisted Bash Egress
+
+Implemented the split network path. The embedded Debian recipe now includes `nftables`. On first container startup, the extension installs a default-drop nftables OUTPUT chain, permitting direct traffic only for container UID 0 and Debian `_apt` UID 42, while allowing the mapped coding UID to connect only to the host proxy address/port. Ordinary commands drop all capabilities; root package-management execs drop `NET_ADMIN` so they cannot rewrite the rules. Bash receives authenticated upper/lowercase `HTTP_PROXY` and `HTTPS_PROXY` settings; bypass attempts remain blocked by nftables.
+
+Added a host-side HTTP proxy with an exact DNS-hostname allowlist configured by `--sandbox-egress-allow`. It supports HTTP on port 80 and HTTPS CONNECT on port 443, rejects IP literals and non-public resolved addresses, pins the selected public address for the connection, and writes destination/method/decision/byte metadata to a per-session host audit log. TLS contents are not intercepted. The allowlist defaults to empty. Updated the security harness to test direct TCP denial and proxy rejection of unallowlisted names, and updated the README.
+
+Added the canonical Apache License 2.0 `LICENSE` and README license reference. Left unrelated untracked `Makefile`, `fibo.c`, and `test_fibo.sh` untouched.
+
+### Test Results / Benchmarks
+
+- Rootless nftables PoC in a disposable container: passed. UID 1000 reached only the permitted host proxy port; another host port was blocked. UID 0 and UID 42 retained direct egress. A root process without `NET_ADMIN` could not flush the ruleset.
+- `node --experimental-strip-types scratch/test-egress-proxy.mjs`: passed hostname normalization, authenticated HTTP/CONNECT rejection for unallowlisted DNS names, unauthenticated 407, and audit logging.
+- `pi -ne -e ./podman-sandbox.ts --help`: passed.
+- `pi -ne -e ./poc/podman-sandbox-security-test.ts --help`: passed.
+- Python RPC-runner AST parse, `git diff --check`, Apache license byte comparison, and mission-log lint: passed.
+- Did not build the changed embedded image or run the full RPC security suite; doing so would execute the Dockerfile's package-install step. The production nftables startup path still needs end-to-end verification after the updated image is built.
+
+## Session 36: Podman Sandbox Extension (2026-10-27)
+
+### What We Decided - Bash UID Invariance
+
+The user rejected a custom UID-lock helper and asked for a Podman-native restriction. The extension already uses `--security-opt=no-new-privileges`; this makes the kernel ignore SUID/SGID and file-capability privilege gains. Tightened ordinary `podman exec` to pass the mapped Pi UID/GID explicitly, while its shell runs without effective capabilities. Added a security assertion for `NoNewPrivs: 1`, zero `CapEff`, and matching real/effective UIDs. No Bash tool input exposes a user override. This prevents transitions to a different UID without adding a helper or breaking APT's separate root execution path.
+
+### Test Results / Benchmarks
+
+- In a disposable rootless container with `--security-opt=no-new-privileges`, `/proc/self/status` reported `NoNewPrivs: 1` and UID/EUID `1000/1000`; `setpriv --reuid=0` failed.
+- Podman help confirms the supported container option is `--security-opt=no-new-privileges`; `podman exec` has no per-exec mount/security-opt switch for the rootfs.
+- Extension/security-adapter help load and `git diff --check`: passed.
+
+## Session 37: Podman Sandbox Extension (2026-10-27)
+
+### What We Learned - Podman Exec UID Behavior
+
+Repeated the UID check through an actual `podman exec` into a persistent rootless container (rather than only the initial container process). The exec'd mapped user also reported `NoNewPrivs: 1`, had UID/EUID `1000/1000`, and could not `setpriv --reuid=0`. The temporary container was removed after the check.
+
+## Session 38: Podman Sandbox Extension (2026-10-27)
+
+### What We Did - Setuid SUID-Binary PoC
+
+Built a disposable image from the already-local sandbox image with a tiny root-owned ELF probe marked mode 4755; the probe prints real/effective UIDs. No packages were installed. In a rootless user namespace as UID 1000, the control container without `no-new-privileges` reported `ruid=1000 euid=0`, confirming the test binary can exercise setuid behavior. A persistent container using the extension's capability posture and `--security-opt=no-new-privileges`, tested through `podman exec --user 1000:1000`, reported `ruid=1000 euid=1000`. This directly verifies that the Podman-native setting blocks the setuid transition even when the SUID file exists.
+
+### Test Results / Benchmarks
+
+- SUID control image without NNP: `ruid=1000 euid=0` (expected privilege transition).
+- Same test image with extension-equivalent capabilities and NNP via `podman exec`: `ruid=1000 euid=1000` (transition blocked).
+- Temporary container and image are removed after the experiment; no helper binary or production image changes were needed.

@@ -28,7 +28,27 @@ pi -e ./podman-sandbox.ts --sandbox-image debian:stable-slim
 
 When no image is supplied, the embedded image is tagged using a hash of the Dockerfile and reused when available.
 
-## Isolation model
+## Install in another project
+
+For one project, symlink the extension into that project's `.pi/extensions` directory, then start Pi there:
+
+```bash
+mkdir -p /path/to/project/.pi/extensions
+ln -s /path/to/pi-sandbox/podman-sandbox.ts /path/to/project/.pi/extensions/podman-sandbox.ts
+cd /path/to/project
+pi
+```
+
+Pi may ask you to trust the project before loading its extension.
+
+To enable it for all your projects, symlink it into the user extension directory instead:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+ln -s /path/to/pi-sandbox/podman-sandbox.ts ~/.pi/agent/extensions/podman-sandbox.ts
+```
+
+The global extension directory is `~/.pi/agent/extensions/`. It replaces the standard coding tools in every project and requires rootless Podman there. Replace `/path/to/pi-sandbox` with the absolute path to your checkout. Unlike `cp`, `ln -s` points to the checkout, so updates there are used on the next Pi start without copying again; moving or deleting the checkout breaks the link.
 
 The container is started with:
 
@@ -58,7 +78,7 @@ Only the current project directory is mounted. The extension does not forward Pi
 
 ## Package installation
 
-The embedded image is based on `debian:stable-slim` and contains only basic Debian packages. The `sandbox` tool exposes two operations:
+The embedded image is based on `debian:stable-slim` and includes `git`, Python 3 (`python3` and `python`), and basic Debian coding utilities. The `sandbox` tool exposes two operations:
 
 ```json
 { "list": true }
@@ -91,6 +111,22 @@ Use the native `search` tool for source text lookup. It runs ripgrep inside the 
 
 The tool accepts a regular expression by default, with optional literal matching, case-insensitive matching, file glob, project-relative path, and result limit. If results are truncated, narrow the path or glob.
 
+## Bash output
+
+Each bash invocation redirects the Podman process's stdout and stderr on the host to separate files under the system temporary directory: `session-<session-id>-<epoch-millisecond-command-id>.out` and `.err`. The tool result shows the first 128 lines of each non-empty stream. If a stream exceeds 128 lines, it adds a marker such as `[... full 1240 lines output to /tmp/session-...-1761567161000.out]` and retains that full-output file. Files for streams fully inlined in the result are removed. Empty streams omit their section. The result ends with `[exit code = 213]`.
+
+## Bash network egress
+
+Bash processes have no direct network egress. The container's nftables OUTPUT policy permits ordinary commands to reach only the extension's host-side HTTP proxy; DNS and other protocols cannot bypass it. Configure the proxy with comma-separated exact DNS hostnames:
+
+```bash
+pi -e ./podman-sandbox.ts --sandbox-egress-allow github.com,api.github.com
+```
+
+The default allowlist is empty. The proxy accepts HTTP on port 80 and HTTPS tunnels with CONNECT on port 443. It resolves destination hostnames itself, pins a validated public address for each connection, rejects IP literals and private/reserved destinations, and writes request decisions, destination names, ports, and transferred byte counts to a session audit log under the host temporary directory. HTTPS payloads remain encrypted; the proxy does not inspect or log their contents. Use `--sandbox-verbose` to see the audit-log path.
+
+The fixed `sandbox` APT operations retain direct egress as container root and Debian's `_apt` helper, as they are narrowly constrained package-management commands. Every ordinary exec explicitly selects the mapped Pi UID/GID. The container runs with `no-new-privileges`, which makes SUID/SGID bits and file capabilities ineffective for privilege gain; ordinary execs also have no effective capabilities. Bash UID-transition attempts therefore fail without a helper program. Custom images must provide `nft`, `getent`, and `setpriv`.
+
 ## Path handling
 
 File paths are resolved with `realpath` before access. Existing paths must resolve below the project root. New files are checked by resolving their parent directory, which prevents ordinary `..` and symlink escapes.
@@ -116,13 +152,13 @@ This extension is a local development boundary, not a complete security sandbox:
 
 - The mounted project is read-write by design.
 - Commands in the container can access the container's own filesystem.
-- The package tool runs as container root.
-- Bash can still use network access and could download non-Debian software directly.
-- The package tool enforces Debian-only package syntax and uses APT, but strict network-level enforcement would require a Debian-only proxy or a network policy.
+- The package tool and its APT subprocesses run with direct network egress as namespaced root or `_apt`.
+- Ordinary bash has no direct egress; it can use only DNS hostnames explicitly allowed through the monitored HTTP proxy.
+- HTTPS CONNECT destinations and byte counts are logged, but encrypted request contents are not inspected.
 - `realpath` checks reduce symlink and traversal escapes but do not eliminate every possible time-of-check/time-of-use race.
 - Other Pi extensions continue to run in the Pi agent process unless they implement their own sandboxing.
 
-For stronger isolation, move the remaining host-side file operations into the container and restrict container networking.
+For stronger isolation, move the remaining host-side file operations into the container and keep the proxy allowlist narrow.
 
 ## POC test
 
@@ -140,7 +176,7 @@ For security-boundary coverage, run the registered tools against disposable host
 ./poc/test-podman-sandbox-rpc.py --security --image debian:stable-slim
 ```
 
-The security suite exercises disposable host and container fixtures, but separates the two boundaries. Host-side callback tests check that explicit file-tool operations stay within the project. Container-escape probes run commands inside Podman and test absolute/traversal access to host canaries, whether the container can create a hard link to an unmounted host file, and whether a container-created symlink can read or modify that file. They also check canary disclosure through tool results/RPC/stderr, host-file snapshots, container identity and project ownership, capability dropping, dpkg protection, package-input validation, and bounded structured search. A controlled host TCP receiver reports whether mounted project data can egress; network access is currently allowed by policy, so that result is an audit observation rather than a failure. The suite does not need an LLM provider. Omit `--image` to cover the embedded-image build path as well.
+The security suite exercises disposable host and container fixtures, but separates the two boundaries. Host-side callback tests check that explicit file-tool operations stay within the project. Container-escape probes run commands inside Podman and test absolute/traversal access to host canaries, whether the container can create a hard link to an unmounted host file, and whether a container-created symlink can read or modify that file. They also check canary disclosure through tool results/RPC/stderr, host-file snapshots, container identity and project ownership, capability dropping, dpkg protection, package-input validation, bounded structured search, and that mapped-user direct egress is blocked while the controlled HTTP proxy rejects non-allowlisted DNS names. A controlled host TCP receiver verifies that bash cannot connect directly. The suite does not need an LLM provider. Omit `--image` to cover the embedded-image build path as well.
 
 The user-namespace and privilege behavior can be tested separately with:
 
