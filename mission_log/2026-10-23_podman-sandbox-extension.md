@@ -1779,3 +1779,54 @@ Changed `sandboxContainerSize()` in `podman-sandbox.ts` to fail with a diagnosti
 ### Next Steps
 
 - None for these two accuracy findings.
+
+---
+
+## Session 68: README Specification Pointers (2026-10-28)
+
+### What We Did
+
+Added a short prose section near the top of `README.md` explaining that the README is the usage-oriented overview and linking readers to the deeper system and image-layer specifications. Also linked the specifications index. Kept the pointers in explanatory prose rather than presenting them as a standalone list.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Connects the usage overview to the detailed architecture specifications and their index. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the README documentation update. |
+
+### Test Results / Benchmarks
+
+- `git diff --check -- README.md`: passed.
+- Local Markdown links in `README.md`: passed.
+
+### Next Steps
+
+- None.
+
+---
+
+## Session 69: README Operational Reference Review (2026-10-28)
+
+### What We Did
+
+Reviewed the complete `README.md` against the extension, system specification, image-layer specification, and retained test commands. Reworked it as a technical overview rather than a list of links: it now states the host/container tool split, startup and container lifecycle, rootless and image requirements, supported flags, package model, search bounds, Bash output handling, proxy policy, slash commands, security limits, and test prerequisites. The specification links explain where the detailed contracts live.
+
+Corrected stale or imprecise details found during review: the output exit-code example now uses a placeholder; container naming is described per extension process; package-name restrictions are scoped to the package interface; status size errors are documented; and the nftables PoC prerequisites are stated.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Provides a dry, operational description of behavior, configuration, limits, tests, and specification references. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the README review and changes. |
+
+### Test Results / Benchmarks
+
+- `git diff --check -- README.md`: passed.
+- README local-link, ASCII-7, fenced-code, and stale-text checks: passed.
+- Runtime tests were not run; this change is documentation-only.
+
+### Next Steps
+
+- None.

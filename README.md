@@ -1,16 +1,20 @@
 # Pi Podman Sandbox Extension
 
-A Pi extension that replaces the standard coding tools with a project-boundary-aware setup and runs shell/search work inside a rootless Podman container with a read-only root filesystem.
+This extension registers Pi tools with separate host and container boundaries. `read`, `write`, `edit`, and `ls` use Node filesystem operations in the Pi process after project-path checks. `bash`, `find`, and `search` execute through rootless Podman. The container has one read-write project mount, a read-only root filesystem, and ephemeral `/tmp`, `/var/tmp`, and `/run` mounts. Package changes produce project-derived images; they do not mutate the running container. Ordinary Bash egress is restricted to the managed HTTP proxy.
+
+The extension does not isolate host-side file callbacks, protect data in the mounted project from commands, or constrain other Pi extensions. Path checks are not race-proof.
+
+## Detailed specifications
+
+This README describes the runtime model and common operations. The [system specification](specs/02_SANDBOX_EXTENSION.md) defines tool contracts, lifecycle, trust boundaries, egress policy, output handling, and limitations. The [image-layer specification](specs/01_SANDBOX_IMAGE_LAYERS.md) defines base and project-derived images, package state, reset behavior, and the read-only container filesystem. The [specification index](specs/README.md) links both documents.
 
 ## Requirements
 
-- Pi
-- Node.js supported by Pi
-- Podman
-- A rootless Podman configuration
-- Network access while the base image and per-project APT image layers are built
+- Pi and a Node.js version supported by Pi.
+- Podman configured for rootless operation. Startup fails if Podman is unavailable or rootless mode is disabled.
+- Network access to build the embedded base image or project APT layers when those images are not already available locally. Ordinary Bash egress is separate and controlled by the proxy policy below.
 
-## Usage
+## Quick start and configuration
 
 Run Pi from the project directory:
 
@@ -18,15 +22,23 @@ Run Pi from the project directory:
 pi -e ./podman-sandbox.ts
 ```
 
-The extension checks that rootless Podman is available and verifies the base image during Pi's `session_start`. If the base tag is already available locally, it is reused; if missing, Podman builds it with its normal layer cache. Each project has a derived APT image based on that base and its explicit package list. The session container is named with the project directory and a path hash, plus a per-session suffix so simultaneous Pi sessions do not share mutable containers.
+At `session_start`, the extension checks rootless Podman, reuses or builds the base image, derives any project package image, and starts the proxy. The session container is created on the first operation that needs it. Each extension process gets a separate container named with the project directory, project-path hash, process ID, and random suffix. Package manifests and derived image tags are project-scoped.
 
-A local compatible base image can be selected with:
+With no configured destinations or branch approvals, the allowlist is empty. For example, this invocation permits HTTPS to `github.com` and HTTP to `api.github.com`:
 
 ```bash
-pi -e ./podman-sandbox.ts --sandbox-image localhost/my-debian-base:tag
+pi -e ./podman-sandbox.ts --sandbox-egress-allow github.com,api.github.com:80
 ```
 
-Custom base images must provide the sandbox runtime tools (`nft`, `getent`, `setpriv`, `find`, `rg`, `file`) and Debian APT if project package layers are used.
+The supported extension flags are:
+
+| Flag | Purpose |
+|------|---------|
+| `--sandbox-image <local-image>` | Use an already-local compatible base image. A missing custom image is an error; it is not pulled automatically. |
+| `--sandbox-egress-allow <entries>` | Comma-separated DNS hostname/port pairs allowed through the proxy. A hostname without a port means HTTPS/443; use `:80` for HTTP. |
+| `--sandbox-verbose` | Log lifecycle and diagnostic milestones without printing complete user commands. Pi's `--verbose` also enables these logs. |
+
+The embedded base is based on `debian:stable-slim`. Custom images must already exist locally and are not checked against a complete compatibility test before use. Provide the runtime tools required by enabled operations, including `sh`, `nft`, `getent`, `setpriv`, `find`, `rg`, and `file`; package-layer operations also require Debian APT. Missing tools are reported when the corresponding operation runs.
 
 ## Install in another project
 
@@ -54,115 +66,100 @@ The project mount is read-write so coding changes persist. The rest of the conta
 
 ## Package installation
 
-The embedded base image is based on `debian:stable-slim` and includes `git`, Python 3, and coding utilities. Explicit package additions are recorded in a per-project manifest under the host cache directory, which is not mounted into Podman. The `sandbox` tool exposes:
+The embedded image includes Git, Python 3, and coding utilities. The model-callable `sandbox` tool offers two operations: `{ "list": true }` returns only explicitly requested Debian package names, while `{ "pkg_add": "ripgrep" }` adds a package. Packages already in the base image and transitive dependencies are not listed.
 
-```json
-{ "list": true }
-```
+Package state is stored in a manifest under the host user's cache directory, outside the project mount. When the explicit package list changes, the extension builds a project-specific derived image from the base or optional project-upgrade image, using the complete sorted package list in one `apt-get install --no-remove` operation. APT resolves dependencies and may update explicitly requested packages to available versions. Podman reuses cached layers when possible, and the current session container is replaced so subsequent sandbox commands use the updated image. A failed image build does not publish the candidate manifest.
 
-Lists only explicitly requested Debian package names. Dependencies and packages in the base image are not listed.
+The `pkg_add` operation and `/sandbox add` accept Debian package names only. This restriction applies to the sandbox package interface; it is not a claim that Bash commands accept only Debian package syntax. Package installation happens during Podman image builds, not inside the running Bash container. Custom base images used for package layers must provide Debian APT.
 
-```json
-{ "pkg_add": "ripgrep" }
-```
+Container UID 0 is namespaced by `--userns=keep-id`; it is not host root. Bash runs as the mapped non-root user in a read-only root filesystem, and cannot mutate the package image.
 
-The extension builds a project-specific derived image with the full explicit package list in one `apt-get install --no-remove` command. APT resolves dependencies and may upgrade explicitly listed packages to available versions. Podman reuses cached layers when possible. The running session container is replaced after package-state changes so the next command uses the updated derived image.
-
-Only Debian package-name syntax is accepted. npm, pip, cargo, URLs, local `.deb` files, and shell fragments are rejected. Custom base images used with package additions must provide Debian APT.
-
-Container UID 0 is namespaced by `--userns=keep-id`; it is not host root. Bash runs as the mapped non-root user in a read-only root filesystem; package changes are made by the extension's image-build path, not by Bash.
 ## Search
 
-Use the native `search` tool for source text lookup. It runs ripgrep inside the sandbox, confines the search root to the project, returns structured path/line matches, and caps both result count and captured output. The legacy `grep` tool is hidden. Using `grep`, `rg`, or similar text-search commands through `bash` is discouraged; it bypasses the native result bounds and structured match format.
+Use the native `search` tool for source text lookup. It runs ripgrep inside the sandbox, confines the search root to the project, and returns structured path/line matches. Queries are regular expressions by default; optional literal matching, case-insensitive matching, glob filtering, and a project-relative path are supported. The result limit defaults to 50 lines and can be set from 1 to 200. Captured ripgrep output is capped independently at 1 MiB. If results are marked truncated, narrow the path or glob and search again.
 
-The tool accepts a regular expression by default, with optional literal matching, case-insensitive matching, file glob, project-relative path, and result limit. If results are truncated, narrow the path or glob.
+The legacy `grep` tool is hidden. Shell `grep`, `rg`, and similar searches are discouraged because they bypass the native tool's structured results and bounds.
 
 ## Bash output
 
-Each bash invocation redirects the Podman process's stdout and stderr to separate mode-0600 files under the project-local `.out/` directory: `session-<session-id>-<epoch-millisecond-command-id>.out` and `.err`. The extension creates `.out/.gitignore` containing `*` if it does not already exist. The tool result shows the first 128 lines of each non-empty stream. If a stream exceeds 128 lines, it adds a marker with the complete `.out/` path and line count; the file can then be opened with Pi's `read` tool or by a later sandbox command. Files for streams fully inlined in the result are removed. Empty streams omit their section. The result ends with `[exit code = 213]`. Because `.out/` is inside the writable project mount, sandbox commands can also inspect these retained logs.
+Each Bash invocation sends Podman's stdout and stderr directly to separate mode-0600 files under the project-local `.out/` directory. The extension creates `.out/.gitignore` containing `*` if it is absent, so generated captures are not added to Git by default. The Pi result shows the first 128 lines of each non-empty stream. For streams longer than that, it includes a full path and LF-based line count; use Pi's `read` tool or a later sandbox command to inspect the retained file. Files for streams fully included in the result are deleted, as are empty-stream files. The result ends with `[exit code = <code>]`.
+
+The output files are inside the writable project mount. Commands in the container can therefore read or modify retained captures; this is intentional so large output remains available without loading it all into model context.
 
 ## Bash network egress
 
-Bash processes have no direct network egress. The container's nftables OUTPUT policy permits ordinary commands to reach only the extension's host-side HTTP proxy; all other outbound packets hit an explicit `reject with icmpx type admin-prohibited` rule instead of being silently dropped, so connection attempts fail promptly rather than timing out. DNS and other protocols cannot bypass the proxy. Configure comma-separated exact DNS destinations:
+Ordinary Bash commands have no direct network egress. The container firewall allows the mapped Bash identity to reach only the extension's authenticated host-side HTTP proxy; direct destinations, DNS traffic, and alternate ports are rejected promptly. The default allowlist is empty. Configure exact DNS hostname/port pairs with `--sandbox-egress-allow`:
 
 ```bash
 pi -e ./podman-sandbox.ts --sandbox-egress-allow github.com,api.github.com:80
 ```
 
-Each entry is an exact DNS hostname with an optional port. No suffix means HTTPS/443 only; add `:80` to allow HTTP for that hostname. For example, `github.com,api.github.com:80` allows HTTPS to `github.com` and HTTP to `api.github.com`, but not the reverse. On an unlisted request, Pi asks only to allow the detected `hostname:port`; approval applies to that pair alone and is saved as a non-model-visible custom session entry. It is restored only on branches containing that approval. In non-interactive modes, unlisted destinations remain denied. CLI entries are not changed by session approvals. The proxy resolves destination hostnames itself, pins a validated public address for each connection, rejects IP literals and private/reserved destinations, and writes request decisions, destinations, ports, and transferred byte counts to a session audit log under the host temporary directory. HTTPS payloads remain encrypted; the proxy does not inspect or log their contents. Use `--sandbox-verbose` to see the audit-log path.
+A hostname without a port means HTTPS/443; HTTP requires an explicit `:80`. The example allows HTTPS to `github.com` and HTTP to `api.github.com`, but not the opposite pairs. The proxy supports plain HTTP on port 80 and HTTPS through CONNECT on port 443, resolves names on the host, rejects IP literals and non-public addresses, and connects to a validated numeric address.
 
-The session container drops all capabilities except `NET_ADMIN`, which extension-owned startup uses to install the egress firewall. Bash runs as the mapped UID/GID under `no-new-privileges` in the read-only rootfs; APT does not run in this container. Custom base images must provide `nft`, `getent`, `setpriv`, and Debian APT for derived package images.
+When an authenticated request targets an unlisted pair, an interactive Pi session asks whether to allow that exact `hostname:port`. Approval is stored as a non-model-visible session entry and is restored only on branches containing that entry. Approval applies to the original request; the command does not need to be retried. Without interactive UI, the request remains denied. Session approvals do not change the CLI allowlist. The proxy allows public destinations on the approved port, not selected URL paths or content.
+
+The proxy writes request decisions, destinations, ports, and observed byte counts to a session audit log under the host temporary directory. HTTPS payloads remain encrypted and are not logged. The audit log currently has no explicit rotation policy; use `--sandbox-verbose` to see its path.
+
+The session container drops all capabilities except `NET_ADMIN`, which extension-owned startup uses to install the firewall. Ordinary Bash runs as the mapped UID/GID with no-new-privileges; it does not receive `NET_ADMIN`. Debian APT runs during Podman image builds, through separate build networking, not in the Bash container. A custom image used for package operations must provide Debian APT.
 
 ## Path handling
 
-File paths are resolved with `realpath` before access. Existing paths must resolve below the project root. New files are checked by resolving their parent directory, which prevents ordinary `..` and symlink escapes.
+File paths are resolved with `realpath` before access. Existing paths must resolve below the project root. For new files, the existing parent directory is resolved and checked before creating the destination; this rejects ordinary traversal and symlink escapes. These checks are not atomic with the filesystem operation.
 
 The file tools currently use Pi's host-side filesystem APIs with project-boundary checks. These are explicit host-side tool capabilities, not operations inside the Podman container. Bash, `find`, and native `search` execute in the container; the model-facing grep traversal is disabled in favor of `search`. The security tests report host-callback path checks separately from attempts to escape the command container.
 
 ## User-controlled sandbox maintenance
 
-Running `/sandbox` explains the available commands and shows quick counts for installed explicit packages, allowed `hostname:port` destinations, container size, and recorded HTTP/HTTPS proxy traffic. `/sandbox list` displays the verbose status, including package and destination names, rootfs and writable-layer sizes when the container is running, and transferred-byte counts. Sizes use binary units (`kiB`, `MiB`, `GiB`). Traffic totals come from this session's proxy audit log.
+The model-facing `sandbox` tool can list explicit packages and add a package. Destructive or environment-wide package operations remain user-initiated through slash commands. `/sandbox` shows help and quick status without starting the container; `/sandbox list` starts or ensures the container and shows detailed status. If a started container's size cannot be inspected, status reports the error rather than presenting an image size as if the container were stopped.
 
-LLM tools cannot remove packages or upgrade the sandbox. Those operations are available only through the user-facing slash command:
+| Command | Effect |
+|---------|--------|
+| `/sandbox` or `/sandbox status` | Show help, package/destination counts, size, and proxy traffic. |
+| `/sandbox list` | Start the container if needed; show package and destination names, size, and traffic details. |
+| `/sandbox add <package>` | Add an explicit Debian package; rebuild the project image if package state changes. |
+| `/sandbox remove <package>` | Remove an explicit package from the manifest and rebuild from the remaining list. |
+| `/sandbox refresh` | Rebuild the explicit package layer without its normal build cache; does nothing if the list is empty. |
+| `/sandbox upgrade` | Build a project-specific upgraded base, then rebuild the explicit package layer without the relevant caches. |
+| `/sandbox reset` | Remove this process's container and project-derived image tags, then rebuild from the retained base and manifest. |
 
-```text
-/sandbox
-/sandbox list
-/sandbox refresh
-/sandbox upgrade
-/sandbox add <debian-package>
-/sandbox remove <debian-package>
-/sandbox reset
-```
+Package removal rebuilds from the parent image, so dependencies that are no longer needed disappear naturally. Reset preserves the explicit package list and never removes the shared base image or calls global Podman reset. It does not force-remove another session's container; if a derived image is still in use, Podman may reject its removal and reset reports the error. Before container startup, `/sandbox` reports the selected image size; after startup it reports rootfs and writable-layer sizes. A container-size inspection failure is reported as a status error. Sizes use `B`, `kiB`, `MiB`, `GiB`, or `TiB` units.
 
-`refresh` rebuilds the per-project APT layer using the complete package list with the APT layer cache disabled; `upgrade` rebuilds the separate project upgrade layer with `apt-get update && apt-get upgrade -y`, then rebuilds the package layer. `remove` removes the requested explicit name from the manifest and rebuilds the APT layer from the remaining full list, naturally dropping no-longer-needed dependencies because the layer starts from its parent image. `/sandbox add` is equivalent to `pkg_add`. `reset` force-removes the current project session container and the project's derived APT/upgrade tags, then rebuilds those layers from the retained base and complete package manifest. It preserves the explicit package list, never removes the base image, and does not affect unrelated Podman resources. Podman may reuse cached layers except during explicit refresh/upgrade operations.
+## Security boundary
 
+This extension is a containment boundary, not complete security isolation. The project is mounted read-write and should be treated as available to code running in the container. Pi's file callbacks remain host-side, and their canonical-path checks do not eliminate all filesystem races or hard-link aliasing. Other Pi extensions, Pi itself, Podman, the host kernel, and processes running as the same host UID are outside this container boundary.
 
-This extension is a local development boundary, not a complete security sandbox:
+Ordinary Bash is restricted to the managed proxy. The runtime firewall also has direct-egress exceptions for namespace UID 0 and Debian `_apt` UID 42; normal Bash runs as the mapped UID, and APT package operations run in separate image builds. Audit records include destinations and byte counts, not HTTPS contents.
 
-- The mounted project is read-write by design.
-- Commands in the container can access the container's own filesystem.
-- The package layer is built by Podman from the complete per-project package manifest; its APT processes use build-container network access, separate from Bash's proxy-only egress policy.
-- Ordinary bash has no direct egress; it can use only DNS hostnames explicitly allowed through the monitored HTTP proxy.
-- HTTPS CONNECT destinations and byte counts are logged, but encrypted request contents are not inspected.
-- `realpath` checks reduce symlink and traversal escapes but do not eliminate every possible time-of-check/time-of-use race.
-- Other Pi extensions continue to run in the Pi agent process unless they implement their own sandboxing.
+For the detailed threat model and limitations, see the [system specification](specs/02_SANDBOX_EXTENSION.md).
 
-For stronger isolation, move the remaining host-side file operations into the container and keep the proxy allowlist narrow.
+## POC tests
 
-## POC test
-
-For the full extension startup and command path, run the headless RPC integration test:
+These provider-free tests exercise the extension without selecting an LLM model:
 
 ```bash
 ./poc/test-podman-sandbox-rpc.py
 ```
 
-It starts Pi with only this extension loaded, checks that `/sandbox` is registered, runs `/sandbox list` and `/sandbox` to verify detailed status and the help/stats summary, then resets and recreates a fresh container before final cleanup. Each test run uses an isolated package manifest and project-derived image namespace so it cannot reset another session's derived image. No LLM provider is needed. The base image is reused when available; Podman builds it with normal caching when missing. Pass `--image <local-image>` to select an existing custom base image. The per-operation timeout defaults to 240 seconds and can be changed with `--timeout <seconds>`. On failure, Pi stderr is retained under `scratch/`. Add `--verbose` to print JSONL RPC records, Pi diagnostics, per-test progress, and extension startup/execution milestones. The extension also accepts `--sandbox-verbose` or Pi's `--verbose` when run directly.
+The smoke test loads only this extension, checks command registration, runs `/sandbox list` and `/sandbox`, then resets and recreates its test container before cleanup. It uses an isolated package manifest and image namespace so it does not reset another session's derived images. It reuses a local base image or builds the embedded base if missing; `--image <local-image>` selects a compatible local custom base. Each RPC operation has a 240-second default timeout, adjustable with `--timeout <seconds>`. Failures retain Pi stderr under `scratch/`; `--verbose` prints protocol records and lifecycle progress.
 
-For security-boundary coverage, run the registered tools against disposable host and container fixtures:
+For disposable boundary and package-layer checks:
 
 ```bash
 ./poc/test-podman-sandbox-rpc.py --security
 ```
 
-The security suite exercises disposable host and container fixtures, but separates the two boundaries. Host-side callback tests check that explicit file-tool operations stay within the project. Container-escape probes run commands inside Podman and test absolute/traversal access to host canaries, whether the container can create a hard link to an unmounted host file, and whether a container-created symlink can read or modify that file. They also check canary disclosure through tool results/RPC/stderr, host-file snapshots, container identity and project ownership, the read-only rootfs, readable bounded Bash output, capability dropping, dpkg protection, full-list APT image creation and package survival across reset, package-input validation, bounded structured search, and that mapped-user direct egress is promptly rejected while the controlled HTTP proxy rejects non-allowlisted DNS names. A controlled host TCP receiver verifies that bash cannot connect directly. The suite does not need an LLM provider. Omit `--image` to cover the embedded-base-image build path as well.
+The security suite tests host-side file callbacks separately from commands inside the container. It covers path escapes and canaries, mapped identity and ownership, read-only rootfs, bounded output, capability/UID restrictions, package image creation and reset, structured search, direct-egress rejection, and proxy policy/approval behavior. It performs an isolated `curl` package-layer build, so it needs the same Podman image-build network access as package operations. It does not need an LLM provider. Omit `--image` to cover the embedded base-image build path.
 
-The user-namespace and privilege behavior can be tested separately with:
+Focused tests are available for individual mechanisms:
 
 ```bash
-./poc/podman-sandbox-userns.sh
-./poc/podman-sandbox-userns.sh --verbose
+./poc/test_setuid/run.sh
+IMAGE=localhost/my-sandbox:tag
+python3 -B poc/test_egress/egress-netfilter-poc.py "$IMAGE"
+node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs
 ```
 
-The POC verifies that:
-
-- ordinary commands run as the mapped Pi-agent user;
-- mounted files retain the Pi-agent UID/GID;
-- `sandbox.pkg_add`-style commands run as container root;
-- packages installed as root are visible to subsequent non-root commands.
-
-Scratch output is written below `scratch/`, whose local `.gitignore` contains `*`.
+The nftables test requires an existing local image containing `sh`, Bash, `setpriv`, `getent`, and core utilities such as `date` and `timeout`, plus the host `nft` binary and its shared libraries. The user-namespace script can also be run separately with `./poc/podman-sandbox-userns.sh` (add `--verbose` for diagnostics). It checks mapped identity, project-file ownership, and package-operation identity. See [`poc/README.md`](poc/README.md) for setup and test details.
 
 ## License
 
