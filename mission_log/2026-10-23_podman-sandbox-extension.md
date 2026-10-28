@@ -1612,3 +1612,28 @@ Expanded the UID/privilege diagram in `specs/02_SANDBOX_EXTENSION.md` to show pa
 |------|---------|
 | `specs/02_SANDBOX_EXTENSION.md` | Adds rootless APT build, UID 0, `_apt` UID 42, and separation from runtime identity to the privilege diagram. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the diagram clarification. |
+
+## Session 61: Podman Sandbox Extension (2026-10-28)
+
+### What We Did - Separate UID 0 Paths
+
+Split the UID diagram in `specs/02_SANDBOX_EXTENSION.md` into distinct graphs for the two UID 0 contexts. One shows the temporary rootless Podman build stage where `apt-get` runs as build-stage UID 0 and uses `_apt` UID 42 for downloads. The other shows the session container, where extension-owned startup uses namespace UID 0 with `NET_ADMIN` to install the firewall while ordinary Bash remains the mapped host UID/GID with capabilities cleared and NNP enabled.
+
+### What We Decided
+
+- Keep build-time APT and runtime firewall setup in separate graphs so readers do not infer that APT runs inside the long-lived Bash container.
+- Retain the network diagram's UID 0 and UID 42 direct-egress exceptions, with prose clarifying that package builds use separate Podman build networking.
+
+### Test Results / Benchmarks
+
+- Confirmed five Mermaid blocks total and two distinct UID-specific flowcharts.
+- Mermaid source has no slash-prefixed labels; text remains ASCII-7.
+- `git diff --check`: passed.
+- No runtime code changed; runtime tests were not rerun.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/02_SANDBOX_EXTENSION.md` | Separates APT build-stage UID 0 from session-container firewall UID 0 in two diagrams. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the UID diagram clarification. |

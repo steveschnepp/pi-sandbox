@@ -69,28 +69,35 @@ The guard checks canonical paths before host filesystem operations; it is not an
 
 ### UID and privilege boundary
 
+UID 0 appears in two distinct places in this design. The first graph is the temporary build stage used for APT image creation; the second is the long-running session container where UID 0 is used only by extension-owned firewall setup. The ordinary Bash identity is shown with the session-container path, not mixed into the APT graph.
+
+#### UID 0 during APT image builds
+
 ```mermaid
 flowchart TD
-  subgraph BuildTime["Package image build time"]
-    Manifest[Project package manifest] --> PodmanBuild[Rootless podman build]
-    PodmanBuild --> BuildStage[Temporary image-build stage]
-    BuildStage --> AptRoot[apt-get install as build-stage UID 0]
-    AptRoot -->|network download helper| AptUser[_apt UID 42 in build stage]
-    BuildStage --> DerivedImage[Project-derived image]
-  end
-
-  subgraph Runtime["Long-running session container"]
-    HostUser[Pi host UID and GID] -->|rootless user namespace plus keep-id| MappedIdentity[Mapped container UID and GID]
-    MappedIdentity -->|ordinary podman exec| Setpriv[setpriv clears inherited and ambient capabilities]
-    Setpriv --> BashUser[Bash runs as mapped UID and GID]
-    BashUser -->|NNP 1 blocks setuid privilege gain| SameIdentity[Real and effective IDs stay mapped]
-    Startup[Extension-owned firewall setup] -->|podman exec as UID 0| NamespaceRoot[Container namespace root]
-    NamespaceRoot -->|NET_ADMIN during startup| FirewallSetup[nftables rules installed]
-    NamespaceRoot -.->|is not| HostRoot[Host root]
-  end
+  PiUser[Pi extension runs as host user] --> Build[Rootless podman build]
+  Build --> Stage[Temporary image-build stage]
+  Stage --> AptRoot[apt-get as build-stage UID 0]
+  AptRoot -->|network downloads| AptUser[_apt UID 42 helper]
+  Stage --> Derived[Project-derived package image]
 ```
 
-The package manifest is consumed by rootless Podman's image-build path, not mounted into the long-running session container. `apt-get` installs as UID 0 inside the temporary build stage and uses Debian `_apt` UID 42 as its network-download helper; that traffic uses Podman build networking, not the session container's nftables chain. The session container is created with all capabilities dropped except `NET_ADMIN`, which extension-owned startup uses to install nftables. The ordinary tool path explicitly runs as the mapped host UID/GID through `setpriv`; integration tests assert zero effective capabilities and `NoNewPrivs: 1`. `--userns=keep-id` keeps project file ownership aligned with the Pi user. Container UID 0 is namespace root, not host root. The runtime firewall still has direct-egress accepts for socket UIDs 0 and 42, but ordinary Bash runs as neither identity and package installation does not execute in this container.
+The package manifest is consumed by Podman's rootless image-build path. `apt-get` runs as UID 0 within that temporary build stage and uses Debian `_apt` UID 42 as its network-download helper. This is not the long-running Bash container; package traffic uses Podman build networking.
+
+#### UID 0 during session firewall setup
+
+```mermaid
+flowchart TD
+  HostUser[Pi host UID and GID] -->|rootless user namespace plus keep-id| Mapped[Mapped container UID and GID]
+  Mapped -->|ordinary podman exec| Setpriv[Clear inherited and ambient capabilities]
+  Setpriv --> Bash[Bash as mapped UID and GID]
+  Bash -->|NNP 1 blocks setuid gain| Same[Real and effective IDs stay mapped]
+  Extension[Extension-owned startup] -->|podman exec as UID 0| ContainerRoot[Session-container UID 0]
+  ContainerRoot -->|NET_ADMIN| Nft[nftables rules installed]
+  ContainerRoot -.->|is not| HostRoot[Host root]
+```
+
+The session container is created with all capabilities dropped except `NET_ADMIN`, which extension-owned startup uses to install nftables. Ordinary commands always use the mapped host UID/GID through `setpriv`; integration tests assert zero effective capabilities and `NoNewPrivs: 1`. Container UID 0 is namespace root, not host root. The runtime firewall retains direct-egress accepts for socket UIDs 0 and 42, but ordinary Bash runs as neither identity and package installation does not execute in this container. The network diagram below shows how those UID exceptions relate to the proxy path.
 
 ### Network-egress boundary
 
