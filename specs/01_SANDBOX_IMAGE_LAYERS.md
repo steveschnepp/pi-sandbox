@@ -16,7 +16,7 @@ Today, `sandbox.pkg_add` mutates the persistent container's writable layer. Remo
 - Make package additions available to the next sandbox command without using Bash to mutate the image.
 - Ensure Bash changes persist only in the project mount; non-project scratch writes are ephemeral.
 - Make `/sandbox reset` remove/rebuild only the current project's container and derived image, never run global `podman system reset`.
-- Identify containers by project-directory label and path hash while retaining per-Pi-session uniqueness.
+- Name containers with a sanitized project-directory prefix and path hash, plus process ID and random suffix for per-extension-process uniqueness.
 - Do not add cross-process package-list locks. Concurrent package-state updates are best effort; APT receives the complete current list on each derived-layer install and the manifest is atomically replaced.
 
 ## Non-Goals

@@ -422,7 +422,7 @@ The no-argument status reports package count, destination-pair count, container/
 
 ### Status size semantics
 
-When this extension process's container is running, use `podman container inspect --size` to display total container rootfs bytes and writable-layer bytes. The project bind mount is excluded. If no container is running, display selected runtime image size and say the container is not started. Display bytes as `B`, `kiB`, `MiB`, `GiB`, or `TiB`, with 1024-byte scaling and one decimal for scaled values.
+When this extension process has started its container, use `podman container inspect --size` to display total container rootfs bytes and writable-layer bytes. The project bind mount is excluded. If inspection fails, report a status error rather than substituting image size or claiming the container is not started. Before a container is started, display the selected runtime image size and say the container is not started. Display bytes as `B`, `kiB`, `MiB`, `GiB`, or `TiB`, with 1024-byte scaling and one decimal for scaled values.
 
 ## Bash Output Contract
 

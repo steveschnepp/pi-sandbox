@@ -675,10 +675,17 @@ RUN apt-get update${install} \\
       const inspected = await runPodman([
         "container", "inspect", "--size", "--format", "{{.SizeRootFs}} {{.SizeRw}}", container,
       ], { timeout: 30 });
-      const match = inspected.output.trim().match(/^(\d+)\s+(\d+)$/);
-      if (inspected.code === 0 && match) {
-        return `${formatBytes(Number(match[1]))} rootfs; ${formatBytes(Number(match[2]))} writable layer (project mount excluded)`;
+      if (inspected.code !== 0) {
+        throw new Error(`could not inspect started sandbox container size: ${inspected.output.trim() || `exit code ${inspected.code}`}`);
       }
+      const match = inspected.output.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!match) throw new Error(`could not parse sandbox container size: ${inspected.output.trim()}`);
+      const rootFsBytes = Number(match[1]);
+      const writableBytes = Number(match[2]);
+      if (!Number.isFinite(rootFsBytes) || !Number.isFinite(writableBytes)) {
+        throw new Error(`sandbox container size is not a finite byte count: ${inspected.output.trim()}`);
+      }
+      return `${formatBytes(rootFsBytes)} rootfs; ${formatBytes(writableBytes)} writable layer (project mount excluded)`;
     }
     const inspectedImage = await runPodman(["image", "inspect", "--format", "{{.Size}}", runtimeImage], { timeout: 30 });
     const bytes = Number(inspectedImage.output.trim());
