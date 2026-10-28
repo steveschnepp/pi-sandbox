@@ -2,6 +2,10 @@
 
 This directory keeps small, reproducible experiments that informed the sandbox design. Each `test_*` directory owns its setup, runnable source, and findings; these are focused PoCs, not substitutes for the extension integration suite.
 
+## Standalone coding PoCs
+
+- [`fibo/`](fibo/README.md) contains a small checked-overflow Fibonacci CLI and its standalone C test script.
+
 ## Rootless security experiments
 
 - [`test_setuid/`](test_setuid/README.md) builds a tiny setuid probe without installing packages, then compares rootless Podman execution with and without `no-new-privileges`.
