@@ -1637,3 +1637,38 @@ Split the UID diagram in `specs/02_SANDBOX_EXTENSION.md` into distinct graphs fo
 |------|---------|
 | `specs/02_SANDBOX_EXTENSION.md` | Separates APT build-stage UID 0 from session-container firewall UID 0 in two diagrams. |
 | `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the UID diagram clarification. |
+
+## Session 62: Podman Sandbox Extension (2026-10-28)
+
+### What We Did - Final Architecture Diagram Review
+
+Reviewed the five Mermaid diagrams in `specs/02_SANDBOX_EXTENSION.md` against the latest documented boundary decisions: host callbacks versus container commands, separate build-time and runtime UID 0 paths, mapped-UID Bash identity, and proxy-only egress with exact hostname/port approvals. The diagrams already reflect those distinctions, so no specification edits were needed. Left the pre-existing worktree deletions and untracked `poc/fibo/` content untouched.
+
+### Test Results / Benchmarks
+
+- Static diagram check: five Mermaid blocks, all closed, with expected `flowchart TD` or `sequenceDiagram` headers.
+- ASCII-7 check: passed.
+- `git diff --check -- specs/02_SANDBOX_EXTENSION.md specs/README.md`: passed.
+- No runtime code changed; runtime tests were not run.
+
+### Next Steps
+
+- No diagram changes remain. Revisit the specification only if a behavior or boundary contract changes.
+
+## Session 63: Podman Sandbox Extension (2026-10-28)
+
+### What We Did - Fibonacci PoC Cleanup
+
+Organized the existing Fibonacci CLI, Makefile, and test script under `poc/fibo/`. Added a focused README with reproduction commands and coverage, linked the PoC from `poc/README.md`, and ignored the optional `poc/fibo/fibo` build output. The test script already builds in a temporary directory; the Makefile build target leaves a local executable that `make clean` removes. Kept the root-level removals and new `poc/fibo/` files as the user's working-tree move; did not stage or commit anything.
+
+### Test Results / Benchmarks
+
+- `make -C poc/fibo test`: passed all valid-input, argument-validation, and overflow cases.
+- `make -C poc/fibo`: passed with the configured strict C99 warning flags.
+- `poc/fibo/fibo 93`: printed `12200160415121876738`.
+- `make -C poc/fibo clean`: removed the generated executable.
+- `git check-ignore poc/fibo/fibo`: confirmed the executable is ignored.
+
+### Next Steps
+
+- None for organizing this standalone PoC.
