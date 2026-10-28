@@ -1672,3 +1672,110 @@ Organized the existing Fibonacci CLI, Makefile, and test script under `poc/fibo/
 ### Next Steps
 
 - None for organizing this standalone PoC.
+
+## Session 64: Podman Sandbox Extension (2026-10-28)
+
+### What We Did - Bisectable Commit Split
+
+Committed the Fibonacci PoC relocation and its local documentation/index in `82421b3` (`test: organize Fibonacci PoC under poc`). The three source/build/test files were detected as pure renames; the README and generated-binary ignore rule were additions. Committed this mission-log record separately in `02cc002` (`docs: log Fibonacci PoC cleanup`). Both commits passed staged diff checks, and the worktree was clean after the commits.
+
+### What We Decided
+
+- Keep the runnable PoC organization change separate from its mission-log record so each commit has a focused purpose and the implementation commit remains easy to test or bisect.
+
+### Test Results / Benchmarks
+
+- The tests and build/run/clean checks recorded in the preceding session passed before committing.
+- `git diff --cached --check`: passed before both commits.
+
+### Next Steps
+
+- None for this change.
+
+## Session 65: Podman Sandbox Extension (2026-10-28)
+
+### What We Did - Architecture Finalization Checkpoint
+
+Resumed from the complete project mission log and reviewed the existing specification index plus both sandbox architecture specifications. The logged architecture decisions are already represented: host callbacks are distinct from container commands; base and project-derived package images have separate lifecycles; build-stage APT and runtime firewall UID 0 are shown separately; ordinary Bash uses mapped identity and proxy-only egress; approvals are exact-pair and branch-scoped. The system spec keeps remaining operational limitations explicit rather than presenting them as guarantees.
+
+No specification edits were needed. The worktree contains only the pre-existing append to this mission log; architecture files remain unchanged. Ran the repository diff check, mission-log lint, and static specification checks for ASCII-7 text, local Markdown links, Mermaid fence balance, and the expected five diagrams.
+
+### What We Decided
+
+- Treat the current two-spec structure as the finalized architecture baseline; `01_SANDBOX_IMAGE_LAYERS.md` remains the focused image/package design and `02_SANDBOX_EXTENSION.md` remains the system contract.
+- Keep audit-log retention, cross-process package-state coordination, custom-image preflight, and race-resistant host callbacks documented as open follow-up questions, not blockers to this baseline.
+- Make no code or architecture edits unless a future behavior or boundary decision changes.
+
+### Test Results / Benchmarks
+
+- `git diff --check`: passed.
+- Mission-log lint: passed, one file and zero errors.
+- Static spec checks: passed; local links resolve, all three spec files are ASCII-7, Mermaid fences are balanced, and the system spec contains five diagrams.
+- No runtime code changed; runtime tests were not rerun.
+
+### Next Steps
+
+- None for finalizing the current architecture baseline. Revisit the specs only when implementation behavior or an accepted boundary changes.
+
+---
+
+## Session 66: Specification Accuracy Review (2026-10-28)
+
+### What We Did
+
+Compared `specs/01_SANDBOX_IMAGE_LAYERS.md` and `specs/02_SANDBOX_EXTENSION.md` with the current extension, proxy, user README, and test assertions. The main architecture and security contracts remain aligned: separate project package layers, read-only container rootfs, mapped-UID Bash, proxy-only ordinary egress, exact-pair branch approvals, and bounded output capture.
+
+Found two small wording/behavior edges to resolve in a future documentation or implementation pass. The image-layer spec says container names retain per-Pi-session uniqueness, while the implementation constructs a name once per extension process using the process PID and a random suffix; the system spec already calls this per-extension-process scope. Also, the system spec describes image-size fallback only when no container is running. `sandboxContainerSize()` falls back to image size if `podman container inspect --size` fails even when `started` is true, and labels that fallback "container not started," so an inspect failure can misstate status.
+
+No spec or runtime files were changed during this review.
+
+### What We Decided
+
+- Treat the architecture contracts as substantially accurate; do not reopen settled design decisions.
+- Record the naming-scope wording and size-inspection fallback as minor accuracy issues for follow-up. Decide whether to clarify the spec or correct the status fallback when making the next relevant change.
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed.
+- `pi -ne -e ./podman-sandbox.ts --help`: passed and listed all three sandbox flags.
+- `git diff --check` for the spec files, ASCII-7, local-link, and fenced-code checks: passed.
+- The full stateful RPC security suite was not run; this was a source/spec review and would invoke isolated image/package lifecycle tests.
+
+### Next Steps
+
+- Resolve the container-name scope wording and the `podman container inspect --size` fallback/label behavior at the next documentation or status-code change.
+
+---
+
+## Session 67: Specification Accuracy Corrections (2026-10-28)
+
+### What We Did
+
+Resolved the two accuracy findings from Session 66. Updated `specs/01_SANDBOX_IMAGE_LAYERS.md` to describe container names as using a sanitized project prefix, project-path hash, process ID, and random suffix for per-extension-process uniqueness. Updated `specs/02_SANDBOX_EXTENSION.md` to specify that a started container's size-inspection failure is a status error, while image-size fallback applies only before container startup.
+
+Changed `sandboxContainerSize()` in `podman-sandbox.ts` to fail with a diagnostic when inspection of a started container fails or returns malformed/non-finite size values. It no longer reports image size with the misleading "container not started" label in that case.
+
+### What We Decided
+
+- Keep the status size behavior fail-explicit: an inspection failure for a started container is surfaced to the status command instead of substituting a different measurement.
+- Describe container uniqueness according to the extension process identity actually used by the implementation.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Reports container-size inspection/parse failures rather than masking them as an unstarted container. |
+| `specs/01_SANDBOX_IMAGE_LAYERS.md` | Clarifies container naming and per-extension-process uniqueness. |
+| `specs/02_SANDBOX_EXTENSION.md` | Documents size-inspection failure behavior and image-size fallback scope. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records the accuracy fixes and verification. |
+
+### Test Results / Benchmarks
+
+- `pi -ne -e ./podman-sandbox.ts --help`: passed; extension parsed and loaded.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed.
+- `git diff --check`, ASCII-7, local-link, and fenced-code checks: passed.
+- The stateful RPC security suite was not run; no package or container lifecycle behavior was changed.
+
+### Next Steps
+
+- None for these two accuracy findings.
