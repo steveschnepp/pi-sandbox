@@ -12,6 +12,13 @@ This README describes the runtime model and common operations. The [system speci
 
 - Pi and a Node.js version supported by Pi.
 - Podman configured for rootless operation. Startup fails if Podman is unavailable or rootless mode is disabled.
+- A storage directory chain that subordinate UIDs can traverse. The sandbox runs with `--userns=keep-id`, so the container init is the first subordinate UID from `/etc/subuid` (`165536` on this host) while Podman's storage lives below `$HOME`. Every directory from `$HOME` down to `containers/storage` must therefore be searchable by other UIDs:
+
+  ```bash
+  chmod o+x ~/.local ~/.local/share ~/.local/share/containers ~/.local/share/containers/storage
+  ```
+
+  Use `o+x` only (mode `0711`): traversal is granted, listing is not, and each directory keeps its own permissions. If these directories are `0700` and owned by the login UID, every `bash`/`find`/`search` call fails with `crun: open …/overlay/<id>/merged: Permission denied: OCI permission denied` even though the reported path is not the component that denied access. See [`mission_log/2026-10-29_keep-id-rootfs-permission-denied.md`](mission_log/2026-10-29_keep-id-rootfs-permission-denied.md) for the full analysis.
 - Network access to build the embedded base image or project APT layers when those images are not already available locally. Ordinary Bash egress is separate and controlled by the proxy policy below.
 
 ## Quick start and configuration
