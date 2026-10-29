@@ -1830,3 +1830,36 @@ Corrected stale or imprecise details found during review: the output exit-code e
 ### Next Steps
 
 - None.
+
+---
+
+## Session 70: Package List Adds (2026-10-29)
+
+### What We Did
+
+Let package adds take a list instead of forcing one tool call per package. The model-callable `sandbox` tool's `pkg_add` now accepts a single Debian package name or a non-empty list of names; every name is validated with the existing Debian name rule before any image build starts, duplicates are collapsed, and the whole list is applied in one derived-image rebuild, so a batch costs one build instead of N. The user-facing `/sandbox add` command accepts the same list form (`/sandbox add curl git`) and still reports all names in its completion message; `remove` and the other maintenance operations remain single-name.
+
+Validation deliberately stays in the execute path rather than the schema: the TypeBox schema only enforces shape and non-emptiness, and the existing name regex rejects shell syntax, which keeps the injection rejection test meaningful for both the single-name and list forms.
+
+Updated the README, the system specification (tool contract and slash-command table), and the image-layer specification to describe the list form, and added two security-suite records: one that installs `procps` and `netbase` through a single `pkg_add` list and verifies both with `dpkg-query`, and one that confirms a list containing an invalid name is rejected before execution without touching the host sentinel.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | `pkg_add` schema accepts a name or a list; handler normalizes, validates, dedupes, and reports; `/sandbox add` takes a package list. |
+| `poc/podman-sandbox-security-test.ts` | Adds list-add success and list-validation rejection records. |
+| `README.md` | Documents the list form for the tool and `/sandbox add`. |
+| `specs/02_SANDBOX_EXTENSION.md` | Specifies the list input, pre-build validation, single rebuild, and the `/sandbox add <package...>` table row. |
+| `specs/01_SANDBOX_IMAGE_LAYERS.md` | States that every requested name is validated before the candidate list is built. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records this change. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types --check podman-sandbox.ts` and the same check on `poc/podman-sandbox-security-test.ts`: passed.
+- TypeBox schema probe: `{"list":true}`, `{"pkg_add":"curl"}`, and `{"pkg_add":["curl","git"]}` accepted; `{"pkg_add":[]}` and empty names rejected; injection strings pass the schema and are rejected by the name regex.
+- `python3 poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 44/44 checks, including the two new package-list records.
+
+### Next Steps
+
+- None.

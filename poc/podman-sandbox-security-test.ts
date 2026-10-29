@@ -553,6 +553,24 @@ export default function (pi: ExtensionAPI) {
           const verify = await bash("curl --version");
           assert(verify.exit_code === 0 && verify.output.startsWith("curl "), `curl was not available after pkg_add: ${verify.formattedOutput}`);
         });
+        await record("package tool accepts a list of packages in one build", async () => {
+          const install = await tool("sandbox", { pkg_add: ["procps", "netbase"] });
+          assert(install.details?.exitCode === 0 && !install.isError, `sandbox.pkg_add list failed: ${JSON.stringify(install.content)}`);
+          const verify = await bash("dpkg-query -W -f='${Package}\\n' procps netbase");
+          const listed = verify.output.split("\n").map((line) => line.trim()).filter(Boolean);
+          assert(verify.exit_code === 0 && listed.includes("procps") && listed.includes("netbase"), `list packages were not installed by one pkg_add call: ${verify.formattedOutput}`);
+        });
+        await record("package tool validates every name in a list before execution", async () => {
+          try {
+            await tool("sandbox", { pkg_add: ["procps", `coreutils; touch ${outsideFile}`] });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            assert(message.includes("pkg_add accepts Debian package names only"), `package tool rejected a list for the wrong reason: ${message}`);
+            assert((await fs.readFile(outsideFile, "utf8")) === sentinel, "host sentinel changed by package-list injection");
+            return;
+          }
+          throw new Error("package tool accepted shell syntax in a package list");
+        });
         await record("package tool rejects shell syntax before execution", async () => {
           try {
             await tool("sandbox", { pkg_add: `coreutils; touch ${outsideFile}` });

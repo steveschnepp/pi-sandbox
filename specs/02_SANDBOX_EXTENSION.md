@@ -225,7 +225,7 @@ The extension uses Pi's exported factories for the standard read/write/edit/ls/f
 | `search` | ripgrep JSON mode inside container | Regex by default; optional literal, case-insensitive, glob, project-relative path, and result limit. Returns structured matches and truncation status. |
 | `grep` | Legacy Pi factory, hidden exposure | Not model-visible. Its backend traversal is not treated as containerized. |
 | `bash` | Podman exec as mapped UID/GID | Executes user command string in project cwd with controlled proxy environment and split output capture. |
-| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }` and `{ "pkg_add": "<debian-name>" }`. Removal, upgrade, refresh, reset, and status remain user slash commands. |
+| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }` and `{ "pkg_add": "<debian-name>" }` or `{ "pkg_add": ["<debian-name>", ...] }`. Removal, upgrade, refresh, reset, and status remain user slash commands. |
 
 ### Host path guard
 
@@ -403,7 +403,13 @@ or:
 { "pkg_add": "curl" }
 ```
 
-`list` returns explicit package names. `pkg_add` validates before building, updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
+or a list of names:
+
+```json
+{ "pkg_add": ["curl", "git"] }
+```
+
+`list` returns explicit package names. `pkg_add` accepts a single Debian package name or a non-empty list of them; each name is validated before any image build starts, duplicates are collapsed, and the whole list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
 
 ### User slash command behavior
 
@@ -414,7 +420,7 @@ or:
 | `/sandbox list` | Start/ensure the current container, then show verbose package names, allowed pair names, rootfs/writable layer size if inspectable, and proxy traffic counters. |
 | `/sandbox refresh` | Rebuild explicit package layer without its normal cache. If the manifest has no explicit packages, report that no APT packages need refreshing. |
 | `/sandbox upgrade` | Set `upgraded=true`, rebuild upgrade and dependent package layers without cache. |
-| `/sandbox add <package>` | Validate and add explicit package, then rebuild using the full candidate list. |
+| `/sandbox add <package...>` | Validate each requested name and add them together, then rebuild once using the full candidate list. |
 | `/sandbox remove <package>` | Remove only a currently explicit package name and rebuild from remaining names. Dependencies disappear naturally when no longer required by the fresh parent-derived image. |
 | `/sandbox reset` | Remove current container and project-derived image tags, retain base and manifest, then derive current project image again. |
 

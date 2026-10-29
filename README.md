@@ -73,11 +73,11 @@ The project mount is read-write so coding changes persist. The rest of the conta
 
 ## Package installation
 
-The embedded image includes Git, Python 3, and coding utilities. The model-callable `sandbox` tool offers two operations: `{ "list": true }` returns only explicitly requested Debian package names, while `{ "pkg_add": "ripgrep" }` adds a package. Packages already in the base image and transitive dependencies are not listed.
+The embedded image includes Git, Python 3, and coding utilities. The model-callable `sandbox` tool offers two operations: `{ "list": true }` returns only explicitly requested Debian package names, while `{ "pkg_add": "ripgrep" }` adds a package and `{ "pkg_add": ["ripgrep", "curl"] }` adds a list of packages in one image rebuild. Packages already in the base image and transitive dependencies are not listed.
 
 Package state is stored in a manifest under the host user's cache directory, outside the project mount. When the explicit package list changes, the extension builds a project-specific derived image from the base or optional project-upgrade image, using the complete sorted package list in one `apt-get install --no-remove` operation. APT resolves dependencies and may update explicitly requested packages to available versions. Podman reuses cached layers when possible, and the current session container is replaced so subsequent sandbox commands use the updated image. A failed image build does not publish the candidate manifest.
 
-The `pkg_add` operation and `/sandbox add` accept Debian package names only. This restriction applies to the sandbox package interface; it is not a claim that Bash commands accept only Debian package syntax. Package installation happens during Podman image builds, not inside the running Bash container. Custom base images used for package layers must provide Debian APT.
+The `pkg_add` operation and `/sandbox add` accept Debian package names only, whether given as one name or as a list. Every name in a list is validated before any image build starts. This restriction applies to the sandbox package interface; it is not a claim that Bash commands accept only Debian package syntax. Package installation happens during Podman image builds, not inside the running Bash container. Custom base images used for package layers must provide Debian APT.
 
 Container UID 0 is namespaced by `--userns=keep-id`; it is not host root. Bash runs as the mapped non-root user in a read-only root filesystem, and cannot mutate the package image.
 
@@ -117,13 +117,13 @@ The file tools currently use Pi's host-side filesystem APIs with project-boundar
 
 ## User-controlled sandbox maintenance
 
-The model-facing `sandbox` tool can list explicit packages and add a package. Destructive or environment-wide package operations remain user-initiated through slash commands. `/sandbox` shows help and quick status without starting the container; `/sandbox list` starts or ensures the container and shows detailed status. If a started container's size cannot be inspected, status reports the error rather than presenting an image size as if the container were stopped.
+The model-facing `sandbox` tool can list explicit packages and add one package or a list of packages. Destructive or environment-wide package operations remain user-initiated through slash commands. `/sandbox` shows help and quick status without starting the container; `/sandbox list` starts or ensures the container and shows detailed status. If a started container's size cannot be inspected, status reports the error rather than presenting an image size as if the container were stopped.
 
 | Command | Effect |
 |---------|--------|
 | `/sandbox` or `/sandbox status` | Show help, package/destination counts, size, and proxy traffic. |
 | `/sandbox list` | Start the container if needed; show package and destination names, size, and traffic details. |
-| `/sandbox add <package>` | Add an explicit Debian package; rebuild the project image if package state changes. |
+| `/sandbox add <package...>` | Add one or more explicit Debian packages in a single rebuild of the project image if package state changes. |
 | `/sandbox remove <package>` | Remove an explicit package from the manifest and rebuild from the remaining list. |
 | `/sandbox refresh` | Rebuild the explicit package layer without its normal build cache; does nothing if the list is empty. |
 | `/sandbox upgrade` | Build a project-specific upgraded base, then rebuild the explicit package layer without the relevant caches. |

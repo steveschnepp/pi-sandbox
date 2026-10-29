@@ -53,9 +53,19 @@ RUN apt-get update \\
     && rm -rf /var/lib/apt/lists/*
 `;
 
+// pkg_add takes one name or a list so a batch of packages costs one derived-image
+// rebuild instead of one tool call per package.
+const pkgAddSchema = Type.Union([
+  Type.String({ minLength: 1, description: "Debian package name to add" }),
+  Type.Array(Type.String({ minLength: 1 }), {
+    minItems: 1,
+    description: "Debian package names to add together in a single image build",
+  }),
+]);
+
 const packageSchema = Type.Union([
   Type.Object({ list: Type.Literal(true) }),
-  Type.Object({ pkg_add: Type.String({ minLength: 1 }) }),
+  Type.Object({ pkg_add: pkgAddSchema }),
 ]);
 
 const searchSchema = Type.Object({
@@ -925,7 +935,7 @@ RUN apt-get update${install} \\
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Inspect the per-project explicit Debian package list or add one package. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
+    description: "Inspect the per-project explicit Debian package list or add one package or a list of packages in a single build. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
     parameters: packageSchema,
     async execute(_id, input) {
       if ("list" in input) {
@@ -933,16 +943,20 @@ RUN apt-get update${install} \\
         const text = packageState.packages.length ? packageState.packages.join("\n") : "No explicitly added packages";
         return { content: [{ type: "text", text }], details: { packages: packageState.packages } };
       }
-      if (!/^[a-z0-9][a-z0-9+.-]*$/.test(input.pkg_add)) {
-        throw new Error("pkg_add accepts Debian package names only");
+      const requested = Array.isArray(input.pkg_add) ? input.pkg_add : [input.pkg_add];
+      const invalid = requested.find((name) => !/^[a-z0-9][a-z0-9+.-]*$/.test(name));
+      if (invalid !== undefined) {
+        throw new Error(`pkg_add accepts Debian package names only: ${invalid}`);
       }
+      const names = [...new Set(requested)];
+      const summary = names.length === 1 ? `Added ${names[0]}` : `Added ${names.length} packages (${names.join(", ")})`;
       try {
         await mutatePackageState((current) => ({
           ...current,
-          packages: [...current.packages, input.pkg_add],
+          packages: [...current.packages, ...names],
         }));
         return {
-          content: [{ type: "text", text: `Added ${input.pkg_add} to the project APT image. The next sandbox command will use the updated image.` }],
+          content: [{ type: "text", text: `${summary} to the project APT image. The next sandbox command will use the updated image.` }],
           details: { exitCode: 0, packages: packageState.packages, image: runtimeImage },
         };
       } catch (error) {
@@ -959,14 +973,20 @@ RUN apt-get update${install} \\
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const operation = parts.shift() ?? "status";
-      const packageName = parts.shift();
-      const needsPackage = operation === "add" || operation === "remove";
-      if (parts.length > 0 || (needsPackage && !packageName) || (!needsPackage && packageName)) {
-        ctx.ui.notify("Usage: /sandbox [status|list|refresh|upgrade|add <package>|remove <package>|reset]", "warning");
+      // add takes a list so one user command can request several packages and
+      // share a single rebuild; the other package operations stay single-name.
+      const takesList = operation === "add";
+      const needsPackage = takesList || operation === "remove";
+      const packageNames = needsPackage ? (takesList ? parts : parts.slice(0, 1)) : [];
+      const packageName = packageNames[0];
+      const unexpected = takesList ? [] : parts.slice(1);
+      if (unexpected.length > 0 || (needsPackage && packageNames.length === 0) || (!needsPackage && parts.length > 0)) {
+        ctx.ui.notify("Usage: /sandbox [status|list|refresh|upgrade|add <package...>|remove <package>|reset]", "warning");
         return;
       }
-      if (packageName && !/^[a-z0-9][a-z0-9+.-]*$/.test(packageName)) {
-        ctx.ui.notify("Invalid Debian package name", "error");
+      const invalidName = packageNames.find((name) => !/^[a-z0-9][a-z0-9+.-]*$/.test(name));
+      if (invalidName !== undefined) {
+        ctx.ui.notify(`Invalid Debian package name: ${invalidName}`, "error");
         return;
       }
       if (operation === "reset") {
@@ -988,7 +1008,7 @@ RUN apt-get update${install} \\
             "  /sandbox list     show detailed package, destination, size, and traffic status",
             "  /sandbox refresh  rebuild explicit packages from current repositories",
             "  /sandbox upgrade  upgrade the project sandbox image",
-            "  /sandbox add <package>    add a Debian package",
+            "  /sandbox add <package...>  add one or more Debian packages",
             "  /sandbox remove <package> remove an explicit package",
             "  /sandbox reset    rebuild this project's sandbox from its base and package list",
             "",
@@ -1019,8 +1039,11 @@ RUN apt-get update${install} \\
           return;
         }
         if (operation === "add") {
-          await mutatePackageState((current) => ({ ...current, packages: [...current.packages, packageName!] }));
-          ctx.ui.notify(`add completed; ${packageName} is in the project APT image`, "info");
+          await mutatePackageState((current) => ({ ...current, packages: [...current.packages, ...packageNames] }));
+          const added = packageNames.length === 1
+            ? `${packageName} is in the project APT image`
+            : `${packageNames.length} packages are in the project APT image (${packageNames.join(", ")})`;
+          ctx.ui.notify(`add completed; ${added}`, "info");
           return;
         }
         if (operation === "remove") {
