@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { parseEgressAllowlist, startManagedEgressProxy, type ManagedEgressProxy } from "./egress-proxy.ts";
+import { parseEgressAllowlist, proxyUserinfo, startManagedEgressProxy, type ManagedEgressProxy } from "./egress-proxy.ts";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -882,7 +882,9 @@ RUN apt-get update${install} \\
     exec: async (command, cwd, options) => {
       const checkedCwd = await guard.directory(cwd);
       const proxy = await ensureProxy();
-      const proxyUrl = `http://${proxy.token}@host.containers.internal:${proxy.port}`;
+      // Both halves travel in the proxy URL: username first, password after the
+      // colon. A username alone makes wget omit the auth header entirely.
+      const proxyUrl = `http://${proxyUserinfo(proxy.token)}@host.containers.internal:${proxy.port}`;
       const commandOutputDirectory = await prepareOutputDirectory();
       const commandId = nextBashCommandId();
       const result = await exec(command, {

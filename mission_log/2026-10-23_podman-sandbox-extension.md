@@ -1955,3 +1955,40 @@ One trust-boundary statement changed: branch approvals were previously never vis
 ### Next Steps
 
 - None.
+
+---
+
+## Session 74: Split Proxy Token into Username and Password (2026-10-29)
+
+### What We Did
+
+Diagnosed why `wget` could not use the sandbox proxy: the proxy URL carried the whole token as the username with no password, and `wget 1.25` sends no `Proxy-Authorization` header at all in that case, so every request failed authentication. Confirmed with a local probe server: `http://<token>@host:port` produced `auth: null`, while `http://<first8>:<rest>@host:port` produced `Basic base64("<first8>:<rest>")`.
+
+Fixed it by splitting the token in two and keeping HTTP Basic: `proxyUserinfo(token)` in `egress-proxy.ts` returns the first 8 characters as the username and the remaining characters as the password. The proxy's `isAuthorized` now expects exactly that credential (still constant-time, still length-checked), the Bash proxy URL is built from the same helper so the two halves can never drift apart, and the single-field legacy form `<token>:` is rejected with 407 instead of silently accepted.
+
+Updated every credential builder: the four raw shell probes in the security suite now rebuild the header from both halves through one shared `proxyAuthSetup` string, and `poc/test_egress/egress-proxy-test.mjs` uses `proxyUserinfo` for its HTTP and CONNECT probes and adds a record proving the old single-field credential is refused (audit count 7 to 8).
+
+Added a regression that runs real `wget` inside the container against an approved destination and asserts it gets past authentication to the DNS-failure 502 (never 407); `wget` was added to the suite's `pkg_add` list so it exists in the derived image. The first version of that record targeted `net-a.invalid:80`, which is correctly not approved because `add_net` had approved only `net-a.invalid:443`; retargeting to `net-b.invalid:80` made it pass, which also demonstrates the per-port approval split working.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `egress-proxy.ts` | `proxyUserinfo()` split helper, Basic credential expectation, rejection of the single-field form. |
+| `podman-sandbox.ts` | Proxy URL built from `proxyUserinfo()`. |
+| `poc/podman-sandbox-security-test.ts` | Shared `proxyAuthSetup` for the four raw probes, `wget` added to the CLI-style `pkg_add` record, new wget-authentication record. |
+| `poc/test_egress/egress-proxy-test.mjs` | Probes send the split credential; new legacy-credential rejection assertion; audit wait/count updated. |
+| `README.md` | Documents the split Basic credentials and why a bare username fails for wget. |
+| `specs/02_SANDBOX_EXTENSION.md` | Authentication bullets describe `proxyUserinfo`, the 8-character username split, and the 407 on single-field credentials. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records this change. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types --check` on `egress-proxy.ts`, `podman-sandbox.ts`, and `poc/podman-sandbox-security-test.ts`: passed.
+- `node --experimental-strip-types poc/test_egress/egress-proxy-test.mjs`: passed, including the new 407 assertion for the single-field credential (8 audit records).
+- `python3 poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 51/51 checks, including the wget record (`HTTP/1.1 502` from an approved host, no `407`).
+- Host probe against a local echo server: username-only URL sent no auth header; split URL sent `Basic MDEyMzQ1Njc6...` (first 8 chars as user, remainder as password).
+
+### Next Steps
+
+- None.

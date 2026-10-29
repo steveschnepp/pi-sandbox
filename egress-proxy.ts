@@ -116,10 +116,20 @@ function rejectedStatus(message: string): number {
   return 403;
 }
 
+// HTTP Basic credentials are the token split in two: the first 8 characters are
+// the username and the remaining characters are the password. Clients such as
+// wget send no Proxy-Authorization header at all when the proxy URL carries only
+// a username, so the password half is what makes authentication happen.
+const PROXY_USERNAME_LENGTH = 8;
+
+export function proxyUserinfo(token: string): string {
+  return `${token.slice(0, PROXY_USERNAME_LENGTH)}:${token.slice(PROXY_USERNAME_LENGTH)}`;
+}
+
 function isAuthorized(request: IncomingMessage, token: string): boolean {
   const supplied = request.headers["proxy-authorization"];
   if (typeof supplied !== "string") return false;
-  const expected = `Basic ${Buffer.from(`${token}:`).toString("base64")}`;
+  const expected = `Basic ${Buffer.from(proxyUserinfo(token)).toString("base64")}`;
   const actualBytes = Buffer.from(supplied);
   const expectedBytes = Buffer.from(expected);
   return actualBytes.length === expectedBytes.length && crypto.timingSafeEqual(actualBytes, expectedBytes);

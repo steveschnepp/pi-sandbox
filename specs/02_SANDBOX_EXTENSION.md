@@ -370,8 +370,8 @@ For compatibility with earlier session entries that stored only a hostname, a mi
 ### Proxy behavior and response codes
 
 - Proxy listens on an ephemeral TCP port on the host and uses a per-proxy random 24-byte token encoded as hex.
-- Bash receives uppercase and lowercase `HTTP_PROXY` and `HTTPS_PROXY` values containing the token. `ALL_PROXY` and `NO_PROXY` variants are set empty to prevent environment bypass.
-- Proxy authorization uses a Basic header containing `<token>:` and a constant-time comparison for equal-length values.
+- Bash receives uppercase and lowercase `HTTP_PROXY` and `HTTPS_PROXY` values containing the proxy credentials. `ALL_PROXY` and `NO_PROXY` variants are set empty to prevent environment bypass.
+- Proxy authorization is HTTP Basic built by `proxyUserinfo(token)`: the first 8 characters of the token are the username and the remaining characters are the password, compared with a constant-time comparison for equal-length values. A single-field credential (username with an empty password) is rejected with 407; clients such as wget send no `Proxy-Authorization` header at all when the proxy URL carries only a username, which is why both halves must be present in the URL.
 - HTTP supports absolute-form `http://` requests only, and only port 80. Proxy auth, proxy connection, transfer, and hop-by-hop headers are removed/rewritten before forwarding.
 - HTTPS is passed as CONNECT only, on port 443. TLS payloads pass through untouched.
 - DNS is resolved by the host proxy. The proxy selects a public resolved address and connects to that numeric address, pinning the selected result for the connection. IP literals and private/reserved/documentation/transition ranges are rejected.

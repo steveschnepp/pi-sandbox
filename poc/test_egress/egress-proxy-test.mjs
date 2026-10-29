@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
-import { parseEgressAllowlist, startManagedEgressProxy } from "../../egress-proxy.ts";
+import { parseEgressAllowlist, proxyUserinfo, startManagedEgressProxy } from "../../egress-proxy.ts";
 
-function httpProbe(port, token, target, authorized = true) {
+function httpProbe(port, token, target, authorized = true, userinfo = proxyUserinfo(token)) {
   return new Promise((resolve, reject) => {
     const headers = { Host: new URL(target).host };
-    if (authorized) headers["Proxy-Authorization"] = `Basic ${Buffer.from(`${token}:`).toString("base64")}`;
+    if (authorized) headers["Proxy-Authorization"] = `Basic ${Buffer.from(userinfo).toString("base64")}`;
     const request = http.request({
       hostname: "127.0.0.1",
       port,
@@ -30,7 +30,7 @@ function connectProbe(port, token, target) {
     const chunks = [];
     socket.setTimeout(3000, () => socket.destroy(new Error("CONNECT probe timed out")));
     socket.on("connect", () => socket.write(
-      `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${Buffer.from(`${token}:`).toString("base64")}\r\n\r\n`,
+      `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${Buffer.from(proxyUserinfo(token)).toString("base64")}\r\n\r\n`,
     ));
     socket.on("data", (chunk) => {
       chunks.push(chunk);
@@ -94,8 +94,13 @@ try {
   const deniedConnect = await connectProbe(proxy.port, proxy.token, "blocked.example:443");
   assert.match(deniedConnect, /^HTTP\/1\.1 403 Forbidden\r\n/);
 
-  const records = await waitForAudit(proxy.auditLogPath, 7);
-  assert.equal(records.length, 7);
+  // A single-field credential is the old degenerate form and must not pass: the
+  // split username/password pair is the only accepted Basic credential.
+  const legacySingleField = await httpProbe(proxy.port, proxy.token, "http://allowed.example/", true, `${proxy.token}:`);
+  assert.equal(legacySingleField.status, 407, "token as username with an empty password must be rejected");
+
+  const records = await waitForAudit(proxy.auditLogPath, 8);
+  assert.equal(records.length, 8);
   assert.equal(records[0].allowed, false);
   assert.equal(records[0].reason, "proxy authentication required");
   assert.equal(records[1].host, "allowed.example");
@@ -114,6 +119,8 @@ try {
   assert.equal(records[6].method, "CONNECT");
   assert.equal(records[6].host, "blocked.example");
   assert.equal(records[6].allowed, false);
+  assert.equal(records[7].allowed, false);
+  assert.equal(records[7].reason, "proxy authentication required");
 
   const approvalAllowlist = new Set();
   const approvalRequests = [];

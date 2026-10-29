@@ -14,6 +14,12 @@ const tools = new Map<string, any>();
 const innerEvents = new Map<string, Function[]>();
 let approvalDecision = false;
 const approvalPrompts: { title: string; message: string }[] = [];
+
+// The proxy hands out HTTP Basic credentials as the token split in two: the first
+// 8 characters are the username and the rest is the password. Raw shell probes
+// rebuild the header from both halves; a username alone makes clients such as
+// wget skip the Proxy-Authorization header entirely.
+const proxyAuthSetup = `proxy_cred=\${HTTP_PROXY#http://}; proxy_cred=\${proxy_cred%%@*}; proxy_user=\${proxy_cred%%:*}; proxy_pass=\${proxy_cred#*:}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:%s" "$proxy_user" "$proxy_pass" | base64 -w 0); `;
 let restartInnerSession: (() => Promise<void>) | undefined;
 let currentTestContext: any;
 
@@ -464,7 +470,7 @@ export default function (pi: ExtensionAPI) {
           }
         });
         await record("sandbox proxy asks before denying an unlisted hostname/port pair", async () => {
-          const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://unlisted.invalid/ HTTP/1.1\\r\\nHost: unlisted.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
+          const command = `bash -c '${proxyAuthSetup}exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://unlisted.invalid/ HTTP/1.1\\r\\nHost: unlisted.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
           const result = await bash(command, process.cwd(), 10);
           assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 403"), `proxy did not deny the unlisted DNS destination: ${result.formattedOutput}`);
           const prompt = approvalPrompts.at(-1);
@@ -474,7 +480,7 @@ export default function (pi: ExtensionAPI) {
         await record("approved proxy hostname/port is persisted to the active session branch", async () => {
           approvalDecision = true;
           try {
-            const command = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
+            const command = `bash -c '${proxyAuthSetup}exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
             const result = await bash(command, process.cwd(), 10);
             assert(result.exit_code === 0 && result.output.trim().startsWith("HTTP/1.1 502"), `approved hostname did not pass the allowlist gate to DNS resolution: ${result.formattedOutput}`);
           } finally {
@@ -487,7 +493,7 @@ export default function (pi: ExtensionAPI) {
           assert(restartInnerSession, "test adapter could not replay session startup");
           const promptsBeforeRestore = approvalPrompts.length;
           await restartInnerSession();
-          const retryCommand = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
+          const retryCommand = `bash -c '${proxyAuthSetup}exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "GET http://approved.invalid/ HTTP/1.1\\r\\nHost: approved.invalid\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 502"*) exit 0;; *) exit 42;; esac'`;
           const restored = await bash(retryCommand, process.cwd(), 10);
           assert(restored.exit_code === 0 && restored.output.trim().startsWith("HTTP/1.1 502"), `restored hostname did not pass the allowlist gate: ${restored.formattedOutput}`);
           assert(approvalPrompts.length === promptsBeforeRestore, "session startup did not restore the branch approval");
@@ -517,7 +523,7 @@ export default function (pi: ExtensionAPI) {
           assert(branchRestored.exit_code === 0 && branchRestored.output.trim().startsWith("HTTP/1.1 502"), `returning to the approved branch did not restore access: ${branchRestored.formattedOutput}`);
 
           const promptsBeforeHttps = approvalPrompts.length;
-          const httpsCommand = `bash -c 'proxy_user=\${HTTP_PROXY#http://}; proxy_user=\${proxy_user%%@*}; proxy_port=\${HTTP_PROXY##*:}; auth=$(printf "%s:" "$proxy_user" | base64 -w 0); exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "CONNECT approved.invalid:443 HTTP/1.1\\r\\nHost: approved.invalid:443\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
+          const httpsCommand = `bash -c '${proxyAuthSetup}exec 3<>/dev/tcp/host.containers.internal/$proxy_port; printf "CONNECT approved.invalid:443 HTTP/1.1\\r\\nHost: approved.invalid:443\\r\\nProxy-Authorization: Basic %s\\r\\nConnection: close\\r\\n\\r\\n" "$auth" >&3; IFS= read -r status <&3; printf "%s\\n" "$status"; case "$status" in "HTTP/1.1 403"*) exit 0;; *) exit 42;; esac'`;
           const httpsDenied = await bash(httpsCommand, process.cwd(), 10);
           assert(httpsDenied.exit_code === 0 && httpsDenied.output.trim().startsWith("HTTP/1.1 403"), `HTTP/80 approval incorrectly allowed HTTPS/443: ${httpsDenied.formattedOutput}`);
           assert(approvalPrompts.length === promptsBeforeHttps + 1, "HTTPS/443 did not require its own approval");
@@ -596,11 +602,11 @@ export default function (pi: ExtensionAPI) {
           }
         });
         await record("package tool accepts a space separated package string like a CLI", async () => {
-          const install = await tool("sandbox", { pkg_add: "ed bsdextrautils" });
+          const install = await tool("sandbox", { pkg_add: "ed bsdextrautils wget" });
           assert(install.details?.exitCode === 0 && !install.isError, `space separated pkg_add failed: ${JSON.stringify(install.content)}`);
-          const verify = await bash("dpkg-query -W -f='${Package}\\n' ed bsdextrautils");
+          const verify = await bash("dpkg-query -W -f='${Package}\\n' ed bsdextrautils wget");
           const listed = verify.output.split("\n").map((line) => line.trim()).filter(Boolean);
-          assert(verify.exit_code === 0 && listed.includes("ed") && listed.includes("bsdextrautils"), `space separated names were not installed: ${verify.formattedOutput}`);
+          assert(verify.exit_code === 0 && listed.includes("ed") && listed.includes("bsdextrautils") && listed.includes("wget"), `space separated names were not installed: ${verify.formattedOutput}`);
         });
         await record("package tool names every rejected entry and the reason", async () => {
           const bad = ["curl git=1.0", ["curl", "git/stable"]];
@@ -678,6 +684,15 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           throw new Error("add_net accepted a malformed destination list");
+        });
+
+        await record("wget authenticates to the proxy because both credential halves are set", async () => {
+          // With only a username in the proxy URL wget sends no Proxy-Authorization
+          // header at all, so this passes only because the URL carries user:password.
+          const result = await bash("wget -S -T 10 --tries=1 -O /dev/null http://net-b.invalid/probe 2>&1; true");
+          const output = String(result.formattedOutput ?? result.output);
+          assert(!output.includes("407"), `wget was challenged for proxy authentication: ${output}`);
+          assert(output.includes("502"), `wget did not pass the allowlist gate to DNS resolution: ${output}`);
         });
       } finally {
         // Test fixtures are host-side resources and must not survive successful
