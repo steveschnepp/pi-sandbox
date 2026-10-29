@@ -1863,3 +1863,35 @@ Updated the README, the system specification (tool contract and slash-command ta
 ### Next Steps
 
 - None.
+
+---
+
+## Session 71: Strict Package Base Names (2026-10-29)
+
+### What We Did
+
+Replaced the three copies of the loose package-name regex (manifest read, tool `pkg_add`, `/sandbox add`) with one shared strict base-name pattern plus a reason helper, so the package interface accepts base names only and explains rejections. `VERSION` and release qualifiers (`curl=8.0`, `git/stable`) are rejected instead of being stripped, trailing separators (`curl-`, `curl.`) are rejected, and the message distinguishes a qualifier rejection from a generic malformed name.
+
+Tightening the pattern could not be done as "start and end alphanumeric": that would reject real packages. Checked the local APT name index (`apt-cache pkgnames`, 70,257 names): 30 names end in `+` (`g++`, `vera++`, `elpa-ox-texinfo+`), none end in `-` or `.`, and all start with a lowercase alphanumeric. The pattern `^(?:[a-z0-9]|[a-z0-9][a-z0-9+.-]*[a-z0-9+])$` accepts every one of those names while rejecting `=`, `/`, uppercase, empty, and trailing-separator inputs, so no real package became un-addable.
+
+Validation stays in the execute path rather than the TypeBox schema; the schema still only enforces shape and non-emptiness, and the reason helper formats both the tool error and the slash-command notification.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Shared `PACKAGE_BASE_NAME` pattern and `invalidPackageNameReason` helper; used by manifest reads, the tool, and `/sandbox add`; schema descriptions mention base names. |
+| `poc/podman-sandbox-security-test.ts` | Adds a record rejecting `curl=8.0` and `git/stable` with the qualifier reason. |
+| `README.md` | Documents the base-name rule and qualifier/trailing-separator rejection. |
+| `specs/02_SANDBOX_EXTENSION.md` | Updates the name pattern requirement and the `pkg_add` contract text. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records this change. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types --check` on both TypeScript files: passed.
+- Regex probe against the local APT name index: 70,257/70,257 accepted, 0 false rejections; `curl=8.0`, `git/stable`, `curl-`, `Curl`, and shell-syntax inputs rejected.
+- `python3 poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 45/45 checks, including the new qualifier-rejection record.
+
+### Next Steps
+
+- None.

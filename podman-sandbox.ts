@@ -56,10 +56,10 @@ RUN apt-get update \\
 // pkg_add takes one name or a list so a batch of packages costs one derived-image
 // rebuild instead of one tool call per package.
 const pkgAddSchema = Type.Union([
-  Type.String({ minLength: 1, description: "Debian package name to add" }),
+  Type.String({ minLength: 1, description: "Base Debian package name to add, without any version or release qualifier" }),
   Type.Array(Type.String({ minLength: 1 }), {
     minItems: 1,
-    description: "Debian package names to add together in a single image build",
+    description: "Base Debian package names to add together in a single image build",
   }),
 ]);
 
@@ -67,6 +67,20 @@ const packageSchema = Type.Union([
   Type.Object({ list: Type.Literal(true) }),
   Type.Object({ pkg_add: pkgAddSchema }),
 ]);
+
+// Strict Debian package base name: starts with a lowercase alphanumeric, ends
+// with a lowercase alphanumeric or '+' (real names such as `g++`), and uses
+// only '+', '-', '.' in between. Version (`pkg=1.2`) and release (`pkg/stable`)
+// qualifiers are rejected rather than stripped, and trailing separators such
+// as `curl-` are rejected because no such package can exist. Checked against
+// the local APT name index: every one of its names matches this pattern.
+const PACKAGE_BASE_NAME = /^(?:[a-z0-9]|[a-z0-9][a-z0-9+.-]*[a-z0-9+])$/;
+
+function invalidPackageNameReason(name: string): string {
+  if (/[=/]/.test(name)) return "version and release qualifiers are not accepted";
+  if (/[.+-]$/.test(name)) return "a package name must end with a lowercase letter, digit, or '+'";
+  return "expected a lowercase Debian package base name";
+}
 
 const searchSchema = Type.Object({
   query: Type.String({ minLength: 1, description: "Regex or literal text to find in project files" }),
@@ -367,7 +381,7 @@ export default function (pi: ExtensionAPI) {
       const parsed = JSON.parse(await fs.readFile(packageStatePath, "utf8"));
       if (!parsed || !Array.isArray(parsed.packages)) throw new Error("invalid package manifest");
       const packages = [...new Set(parsed.packages)];
-      if (packages.some((name) => typeof name !== "string" || !/^[a-z0-9][a-z0-9+.-]*$/.test(name))) {
+      if (packages.some((name) => typeof name !== "string" || !PACKAGE_BASE_NAME.test(name))) {
         throw new Error("package manifest contains an invalid Debian package name");
       }
       return { packages: packages.sort(), upgraded: parsed.upgraded === true };
@@ -944,9 +958,9 @@ RUN apt-get update${install} \\
         return { content: [{ type: "text", text }], details: { packages: packageState.packages } };
       }
       const requested = Array.isArray(input.pkg_add) ? input.pkg_add : [input.pkg_add];
-      const invalid = requested.find((name) => !/^[a-z0-9][a-z0-9+.-]*$/.test(name));
+      const invalid = requested.find((name) => !PACKAGE_BASE_NAME.test(name));
       if (invalid !== undefined) {
-        throw new Error(`pkg_add accepts Debian package names only: ${invalid}`);
+        throw new Error(`pkg_add accepts Debian package names only: ${invalid} (${invalidPackageNameReason(invalid)})`);
       }
       const names = [...new Set(requested)];
       const summary = names.length === 1 ? `Added ${names[0]}` : `Added ${names.length} packages (${names.join(", ")})`;
@@ -984,9 +998,9 @@ RUN apt-get update${install} \\
         ctx.ui.notify("Usage: /sandbox [status|list|refresh|upgrade|add <package...>|remove <package>|reset]", "warning");
         return;
       }
-      const invalidName = packageNames.find((name) => !/^[a-z0-9][a-z0-9+.-]*$/.test(name));
+      const invalidName = packageNames.find((name) => !PACKAGE_BASE_NAME.test(name));
       if (invalidName !== undefined) {
-        ctx.ui.notify(`Invalid Debian package name: ${invalidName}`, "error");
+        ctx.ui.notify(`Invalid Debian package name: ${invalidName} (${invalidPackageNameReason(invalidName)})`, "error");
         return;
       }
       if (operation === "reset") {

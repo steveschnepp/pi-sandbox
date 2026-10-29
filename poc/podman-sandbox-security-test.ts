@@ -582,6 +582,19 @@ export default function (pi: ExtensionAPI) {
           }
           throw new Error("package tool accepted shell syntax");
         });
+        await record("package tool rejects version and release qualifiers", async () => {
+          for (const qualified of ["curl=8.0", "git/stable"]) {
+            try {
+              await tool("sandbox", { pkg_add: qualified });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              assert(message.includes("pkg_add accepts Debian package names only"), `package tool rejected ${qualified} for the wrong reason: ${message}`);
+              assert(message.includes("version and release qualifiers are not accepted"), `package tool did not explain the qualifier rule for ${qualified}: ${message}`);
+              continue;
+            }
+            throw new Error(`package tool accepted version-qualified input ${qualified}`);
+          }
+        });
       } finally {
         // Test fixtures are host-side resources and must not survive successful
         // runs or failed assertions.

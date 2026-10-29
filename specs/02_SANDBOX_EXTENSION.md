@@ -277,7 +277,8 @@ By default, `<project-id>` is an 8-character hash of the absolute project root. 
 
 Requirements:
 
-- Package names match `^[a-z0-9][a-z0-9+.-]*$`.
+- Package names match the strict base-name pattern `^(?:[a-z0-9]|[a-z0-9][a-z0-9+.-]*[a-z0-9+])$`: at least one character, starting with a lowercase alphanumeric, ending with a lowercase alphanumeric or `+` (so real names such as `g++` match), and using only `+`, `-`, `.` in between.
+- Version (`pkg=1.2`) and release (`pkg/stable`) qualifiers are rejected with an explicit reason instead of being stripped, as are trailing separators such as `curl-`; only base names reach APT.
 - Package lists are unique and sorted before image derivation.
 - Manifest parent directories are created with mode `0700`; temporary manifest files use mode `0600` and are atomically renamed into place.
 - The candidate derived image is built before changed package state is published.
@@ -409,7 +410,7 @@ or a list of names:
 { "pkg_add": ["curl", "git"] }
 ```
 
-`list` returns explicit package names. `pkg_add` accepts a single Debian package name or a non-empty list of them; each name is validated before any image build starts, duplicates are collapsed, and the whole list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
+`list` returns explicit package names. `pkg_add` accepts a single Debian package name or a non-empty list of them; each name is validated against the strict base-name pattern before any image build starts, so version (`pkg=1.2`) and release (`pkg/stable`) qualifiers are rejected rather than rewritten, duplicates are collapsed, and the whole list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
 
 ### User slash command behavior
 
