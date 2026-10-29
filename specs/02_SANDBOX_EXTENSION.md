@@ -225,7 +225,7 @@ The extension uses Pi's exported factories for the standard read/write/edit/ls/f
 | `search` | ripgrep JSON mode inside container | Regex by default; optional literal, case-insensitive, glob, project-relative path, and result limit. Returns structured matches and truncation status. |
 | `grep` | Legacy Pi factory, hidden exposure | Not model-visible. Its backend traversal is not treated as containerized. |
 | `bash` | Podman exec as mapped UID/GID | Executes user command string in project cwd with controlled proxy environment and split output capture. |
-| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }` and `{ "pkg_add": "<debian-name>" }` or `{ "pkg_add": ["<debian-name>", ...] }`. Removal, upgrade, refresh, reset, and status remain user slash commands. |
+| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }`, `{ "pkg_add": "<debian-names>" }` (one name or a space-separated string), and `{ "pkg_add": ["<debian-names>", ...] }`. Removal, upgrade, refresh, reset, and status remain user slash commands. |
 
 ### Host path guard
 
@@ -279,7 +279,7 @@ Requirements:
 
 - Package names match the strict base-name pattern `^(?:[a-z0-9]|[a-z0-9][a-z0-9+.-]*[a-z0-9+])$`: at least one character, starting with a lowercase alphanumeric, ending with a lowercase alphanumeric or `+` (so real names such as `g++` match), and using only `+`, `-`, `.` in between.
 - Version (`pkg=1.2`) and release (`pkg/stable`) qualifiers are rejected with an explicit reason instead of being stripped, as are trailing separators such as `curl-`; only base names reach APT.
-- Package lists are unique and sorted before image derivation.
+- Package lists are unique and sorted before image derivation; this is the single deduplication point, applied when request names are merged into the stateful manifest.
 - Manifest parent directories are created with mode `0700`; temporary manifest files use mode `0600` and are atomically renamed into place.
 - The candidate derived image is built before changed package state is published.
 - No cross-process lock is implemented. Concurrent project sessions can lose updates; this is best-effort behavior and must not be described as serialized.
@@ -404,13 +404,19 @@ or:
 { "pkg_add": "curl" }
 ```
 
+or a space-separated string, as on a command line:
+
+```json
+{ "pkg_add": "curl git" }
+```
+
 or a list of names:
 
 ```json
 { "pkg_add": ["curl", "git"] }
 ```
 
-`list` returns explicit package names. `pkg_add` accepts a single Debian package name or a non-empty list of them; each name is validated against the strict base-name pattern before any image build starts, so version (`pkg=1.2`) and release (`pkg/stable`) qualifiers are rejected rather than rewritten, duplicates are collapsed, and the whole list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
+`list` returns explicit package names. `pkg_add` accepts a single base Debian package name, a space-separated string, or a non-empty list whose entries may themselves be space-separated strings. The request is parsed into one new list by splitting entries on whitespace, trimming, and dropping empty parts, and that list keeps its order and duplicates. Every entry is then checked against the strict base-name pattern before any image build starts; a rejection reports each offending entry together with its reason (qualifier, trailing separator, or malformed name). Duplicates are collapsed only when the names are merged into the stateful manifest, and the validated list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
 
 ### User slash command behavior
 

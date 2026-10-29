@@ -56,10 +56,10 @@ RUN apt-get update \\
 // pkg_add takes one name or a list so a batch of packages costs one derived-image
 // rebuild instead of one tool call per package.
 const pkgAddSchema = Type.Union([
-  Type.String({ minLength: 1, description: "Base Debian package name to add, without any version or release qualifier" }),
+  Type.String({ minLength: 1, description: "One base Debian package name, or several separated by spaces like a command line, for example 'curl git'" }),
   Type.Array(Type.String({ minLength: 1 }), {
     minItems: 1,
-    description: "Base Debian package names to add together in a single image build",
+    description: "Base Debian package names to add together in a single image build; an entry may itself be a space-separated list",
   }),
 ]);
 
@@ -522,6 +522,8 @@ RUN apt-get update${install} \\
     // accepted for this local development tool, while APT receives the full list.
     packageState = await readPackageState();
     const next = update(packageState);
+    // The only dedupe point: requests keep their own order and duplicates until
+    // they are merged into the stateful package list.
     next.packages = [...new Set(next.packages)].sort();
     await preparePackageState(next, options);
     return next;
@@ -949,7 +951,7 @@ RUN apt-get update${install} \\
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Inspect the per-project explicit Debian package list or add one package or a list of packages in a single build. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
+    description: "Inspect the per-project explicit Debian package list or add packages in a single build, from one name, a space-separated string like a CLI, or a list of names. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
     parameters: packageSchema,
     async execute(_id, input) {
       if ("list" in input) {
@@ -957,12 +959,22 @@ RUN apt-get update${install} \\
         const text = packageState.packages.length ? packageState.packages.join("\n") : "No explicitly added packages";
         return { content: [{ type: "text", text }], details: { packages: packageState.packages } };
       }
-      const requested = Array.isArray(input.pkg_add) ? input.pkg_add : [input.pkg_add];
-      const invalid = requested.find((name) => !PACKAGE_BASE_NAME.test(name));
-      if (invalid !== undefined) {
-        throw new Error(`pkg_add accepts Debian package names only: ${invalid} (${invalidPackageNameReason(invalid)})`);
+      // Build one new list from the request: split entries on spaces, trim, and
+      // drop empties, then check every name so each rejection names the offending
+      // entry and the reason. The parsed order and any duplicates are kept here;
+      // only the stateful package list dedupes, when it merges this request.
+      const names = (Array.isArray(input.pkg_add) ? input.pkg_add : [input.pkg_add])
+        .flatMap((entry) => entry.trim().split(/\s+/))
+        .filter((entry) => entry.length > 0);
+      if (names.length === 0) {
+        throw new Error("pkg_add accepts Debian package names only: the request contained no package name");
       }
-      const names = [...new Set(requested)];
+      const problems = names
+        .filter((name) => !PACKAGE_BASE_NAME.test(name))
+        .map((name) => `${name} (${invalidPackageNameReason(name)})`);
+      if (problems.length > 0) {
+        throw new Error(`pkg_add accepts Debian package names only: ${problems.join("; ")}`);
+      }
       const summary = names.length === 1 ? `Added ${names[0]}` : `Added ${names.length} packages (${names.join(", ")})`;
       try {
         await mutatePackageState((current) => ({
@@ -998,9 +1010,10 @@ RUN apt-get update${install} \\
         ctx.ui.notify("Usage: /sandbox [status|list|refresh|upgrade|add <package...>|remove <package>|reset]", "warning");
         return;
       }
-      const invalidName = packageNames.find((name) => !PACKAGE_BASE_NAME.test(name));
-      if (invalidName !== undefined) {
-        ctx.ui.notify(`Invalid Debian package name: ${invalidName} (${invalidPackageNameReason(invalidName)})`, "error");
+      const invalidNames = packageNames.filter((name) => !PACKAGE_BASE_NAME.test(name));
+      if (invalidNames.length > 0) {
+        const details = invalidNames.map((name) => `${name} (${invalidPackageNameReason(name)})`).join("; ");
+        ctx.ui.notify(`Invalid Debian package name: ${details}`, "error");
         return;
       }
       if (operation === "reset") {

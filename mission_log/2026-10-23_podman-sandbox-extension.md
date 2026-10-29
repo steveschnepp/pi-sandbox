@@ -1895,3 +1895,32 @@ Validation stays in the execute path rather than the TypeBox schema; the schema 
 ### Next Steps
 
 - None.
+
+---
+
+## Session 72: Space-Separated pkg_add Input (2026-10-29)
+
+### What We Did
+
+Let `pkg_add` take a space-separated string the way a shell takes arguments, alongside the existing single name and list forms: `{ "pkg_add": "curl git" }`. The handler builds one new list by splitting every request entry on whitespace, trimming, and dropping empty parts, then iterates that list and regex-checks each name. A rejection always says which entry failed and why, and reports every failing entry in one message (`pkg_add accepts Debian package names only: git=1.0 (version and release qualifiers are not accepted)`), instead of stopping at the first problem. `/sandbox add` already tokenizes on whitespace, so it now reports all invalid names the same way.
+
+Deduplication was deliberately left for the end: the parsed request keeps its order and duplicates while it is validated and reported, and the only dedupe point is `mutatePackageState`, where the names are merged into the stateful manifest. That behavior was already present, so the `new Set` in the tool handler was removed rather than duplicated, and a comment now marks `mutatePackageState` as the single dedupe point.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | Split/trim/validate into a new list with per-entry reasons; all failures reported together; tool and schema descriptions mention the CLI-style form; dedupe comment at the stateful merge. |
+| `poc/podman-sandbox-security-test.ts` | Adds records for a space-separated install and for naming every rejected entry with its reason. |
+| `README.md` | Documents the three add forms, parse-then-check flow, and end-only dedupe. |
+| `specs/02_SANDBOX_EXTENSION.md` | Adds the space-separated example, the parse/validate contract, and marks list uniqueness as the single dedupe point. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records this change. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types --check` on both TypeScript files: passed.
+- `python3 poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 47/47 checks, including `package tool accepts a space separated package string like a CLI` (installs `ed` and `bsdextrautils` from one string, verified with `dpkg-query`) and `package tool names every rejected entry and the reason` (`"curl git=1.0"` and `["curl", "git/stable"]`).
+
+### Next Steps
+
+- None.

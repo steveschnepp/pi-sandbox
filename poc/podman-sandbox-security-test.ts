@@ -595,6 +595,29 @@ export default function (pi: ExtensionAPI) {
             throw new Error(`package tool accepted version-qualified input ${qualified}`);
           }
         });
+        await record("package tool accepts a space separated package string like a CLI", async () => {
+          const install = await tool("sandbox", { pkg_add: "ed bsdextrautils" });
+          assert(install.details?.exitCode === 0 && !install.isError, `space separated pkg_add failed: ${JSON.stringify(install.content)}`);
+          const verify = await bash("dpkg-query -W -f='${Package}\\n' ed bsdextrautils");
+          const listed = verify.output.split("\n").map((line) => line.trim()).filter(Boolean);
+          assert(verify.exit_code === 0 && listed.includes("ed") && listed.includes("bsdextrautils"), `space separated names were not installed: ${verify.formattedOutput}`);
+        });
+        await record("package tool names every rejected entry and the reason", async () => {
+          const bad = ["curl git=1.0", ["curl", "git/stable"]];
+          for (const pkg_add of bad) {
+            const offender = String(pkg_add).includes("=") ? "git=1.0" : "git/stable";
+            try {
+              await tool("sandbox", { pkg_add });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              assert(message.includes("pkg_add accepts Debian package names only"), `package tool rejected ${JSON.stringify(pkg_add)} for the wrong reason: ${message}`);
+              assert(message.includes(offender), `package tool did not name the rejected entry ${offender}: ${message}`);
+              assert(message.includes("version and release qualifiers are not accepted"), `package tool did not explain why ${offender} was rejected: ${message}`);
+              continue;
+            }
+            throw new Error(`package tool accepted mixed valid/invalid input ${JSON.stringify(pkg_add)}`);
+          }
+        });
       } finally {
         // Test fixtures are host-side resources and must not survive successful
         // runs or failed assertions.
