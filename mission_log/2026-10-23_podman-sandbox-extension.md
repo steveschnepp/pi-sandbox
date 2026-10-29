@@ -1924,3 +1924,34 @@ Deduplication was deliberately left for the end: the parsed request keeps its or
 ### Next Steps
 
 - None.
+
+---
+
+## Session 73: list_net and add_net Tool Operations (2026-10-29)
+
+### What We Did
+
+Gave the model-callable `sandbox` tool network administration to match its package administration: `list_net` reports the exact `hostname:port` pairs currently allowed through the proxy, and `add_net` accepts one destination, a space-separated string like a CLI, or a list of them. `add_net` is the only model-callable allowlist mutation, and it cannot add anything without the user: every not-yet-allowed destination goes through the same `Allow <hostname>:<port>?` popup, branch entry, and live Set update that a proxy-detected destination uses, because the handler calls the existing `approveEgressHost`/`requestEgressApproval` path rather than a second approval implementation.
+
+Ordering matters for user experience: the whole request is parsed and validated first, so a malformed entry reports every bad destination with its reason and never reaches the user as a popup. Valid destinations are then confirmed one popup at a time; an already-allowed destination is reported without a popup. The result names allowed, already-allowed, and declined destinations, and any decline makes the result an error.
+
+One trust-boundary statement changed: branch approvals were previously never visible to the model. `list_net` now returns current destinations on explicit request, so the specification now says approvals are not *injected* into model context and are seen only through an explicit `list_net` call, while restoration still comes only from active branch ancestry.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `podman-sandbox.ts` | `netDestinationSchema`, `list_net`/`add_net` variants in the tool schema, `addEgressDestinations` helper with validate-then-approve ordering, tool description. |
+| `poc/podman-sandbox-security-test.ts` | Adds records for `list_net` contents, decline/approve popup gating with branch persistence, and space-separated/list input with pre-popup validation. |
+| `README.md` | Documents the four operations and the `add_net` approval flow in the egress section. |
+| `specs/02_SANDBOX_EXTENSION.md` | Tool table and contract cover `list_net`/`add_net`; interactive-approval section states `add_net` shares the flow; the model-visibility bullet now allows explicit `list_net` reads. |
+| `mission_log/2026-10-23_podman-sandbox-extension.md` | Records this change. |
+
+### Test Results / Benchmarks
+
+- `node --experimental-strip-types --check` on both TypeScript files: passed.
+- `python3 poc/test-podman-sandbox-rpc.py --security --timeout 180`: passed, 50/50 checks, including the three new network-operation records (one popup per destination, declined destination absent from allowlist and branch, approved destination persisted once and visible in `list_net`, malformed request rejected before any popup).
+
+### Next Steps
+
+- None.

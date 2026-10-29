@@ -63,9 +63,23 @@ const pkgAddSchema = Type.Union([
   }),
 ]);
 
-const packageSchema = Type.Union([
+// Like pkg_add, add_net takes one destination, a space-separated string, or a
+// list of destinations.
+const netDestinationSchema = Type.Union([
+  Type.String({ minLength: 1, description: "One destination, or several separated by spaces like a command line, for example 'api.github.com github.com:80'" }),
+  Type.Array(Type.String({ minLength: 1 }), {
+    minItems: 1,
+    description: "Destinations to allow together; an entry may itself be a space-separated list",
+  }),
+]);
+
+const sandboxToolSchema = Type.Union([
   Type.Object({ list: Type.Literal(true) }),
   Type.Object({ pkg_add: pkgAddSchema }),
+  Type.Object({ list_net: Type.Literal(true) }),
+  Type.Object({
+    add_net: netDestinationSchema,
+  }),
 ]);
 
 // Strict Debian package base name: starts with a lowercase alphanumeric, ends
@@ -580,6 +594,57 @@ RUN apt-get update${install} \\
     }
   }
 
+  // Model-callable allowlist mutation. Parse the request like pkg_add, reject
+  // every malformed entry with its reason before anything is asked, then route
+  // each not-yet-allowed destination through the same popup the proxy uses, so
+  // nothing reaches the allowlist without the user confirming it.
+  async function addEgressDestinations(request: string | string[]): Promise<{ content: { type: "text"; text: string }[]; details: { exitCode: number; approved: boolean; destinations: string[] }; isError?: boolean }> {
+    const entries = (Array.isArray(request) ? request : [request])
+      .flatMap((entry) => entry.trim().split(/\s+/))
+      .filter((entry) => entry.length > 0);
+    if (entries.length === 0) {
+      throw new Error("add_net accepts DNS hostnames with an optional :80 or :443 port: the request contained no destination");
+    }
+    const destinations: string[] = [];
+    const problems: string[] = [];
+    for (const entry of entries) {
+      try {
+        destinations.push([...parseEgressAllowlist(entry)][0]);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        problems.push(`${entry} (${reason})`);
+      }
+    }
+    if (problems.length > 0) {
+      throw new Error(`add_net accepts DNS hostnames with an optional :80 or :443 port: ${problems.join("; ")}`);
+    }
+
+    const allowed: string[] = [];
+    const already: string[] = [];
+    const declined: string[] = [];
+    for (const destination of destinations) {
+      const separator = destination.lastIndexOf(":");
+      const hostname = destination.slice(0, separator);
+      const port = Number(destination.slice(separator + 1));
+      if (egressAllowlist.has(destination)) {
+        already.push(destination);
+        continue;
+      }
+      const approved = await approveEgressHost(hostname, port);
+      if (approved && egressAllowlist.has(destination)) allowed.push(destination);
+      else declined.push(destination);
+    }
+
+    const parts: string[] = [];
+    if (allowed.length) parts.push(`allowed after the user approved the popup: ${allowed.join(", ")}`);
+    if (already.length) parts.push(`already allowed, so no popup was shown: ${already.join(", ")}`);
+    if (declined.length) parts.push(`not added because the user did not approve the popup: ${declined.join(", ")}`);
+    const details = { destinations: [...egressAllowlist].sort(), approved: declined.length === 0 };
+    return declined.length
+      ? { content: [{ type: "text", text: `add_net: ${parts.join("; ")}.` }], details: { ...details, exitCode: 1 }, isError: true }
+      : { content: [{ type: "text", text: `add_net: ${parts.join("; ")}.` }], details: { ...details, exitCode: 0 } };
+  }
+
   async function ensureProxy(): Promise<ManagedEgressProxy> {
     if (managedProxy) return managedProxy;
     if (!proxyStarting) {
@@ -951,13 +1016,22 @@ RUN apt-get update${install} \\
   pi.registerTool({
     name: "sandbox",
     label: "Sandbox package manager",
-    description: "Inspect the per-project explicit Debian package list or add packages in a single build, from one name, a space-separated string like a CLI, or a list of names. Package changes rebuild a derived image from the full package list, leaving the shared base image unchanged.",
-    parameters: packageSchema,
+    description: "Inspect or add sandbox resources: package operations (list, pkg_add) rebuild the project APT image, and network operations (list_net, add_net) inspect or extend the proxy allowlist. add_net accepts one destination, a space-separated string, or a list, and every new destination is added only after the user approves it in a popup.",
+    parameters: sandboxToolSchema,
     async execute(_id, input) {
       if ("list" in input) {
         packageState = await readPackageState();
         const text = packageState.packages.length ? packageState.packages.join("\n") : "No explicitly added packages";
         return { content: [{ type: "text", text }], details: { packages: packageState.packages } };
+      }
+      if ("list_net" in input) {
+        // Read-only counterpart to add_net, mirroring list/pkg_add for packages.
+        const destinations = [...egressAllowlist].sort();
+        const text = destinations.length ? destinations.join("\n") : "No destinations are allowed through the sandbox proxy";
+        return { content: [{ type: "text", text }], details: { destinations } };
+      }
+      if ("add_net" in input) {
+        return addEgressDestinations(input.add_net);
       }
       // Build one new list from the request: split entries on spaces, trim, and
       // drop empties, then check every name so each rejection names the offending

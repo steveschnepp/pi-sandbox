@@ -17,7 +17,7 @@ The extension is a local development containment boundary, not a complete hostil
 - Keep persistent writes to the project mount; make non-project scratch paths ephemeral and the container root filesystem read-only.
 - Enforce proxy-only egress for the mapped Bash identity at the container network layer.
 - Allow network destinations only as exact normalized DNS hostname/port pairs; bare CLI hostnames mean HTTPS/443, and HTTP/80 requires explicit `:80`.
-- Require user confirmation for an unlisted pair in an interactive UI and store approval only in the active Pi session branch.
+- Require user confirmation for an unlisted pair in an interactive UI and store approval only in the active Pi session branch; the model-callable `add_net` operation uses the same confirmation and storage path and cannot add a destination without it.
 - Manage project package additions through a host-side manifest and derived Podman image layers, never by letting Bash mutate package state.
 - Keep Bash output bounded in Pi context while retaining long output in ignored, project-readable files.
 - Provide status/help output and provider-free tests for the relevant trust boundaries.
@@ -225,7 +225,7 @@ The extension uses Pi's exported factories for the standard read/write/edit/ls/f
 | `search` | ripgrep JSON mode inside container | Regex by default; optional literal, case-insensitive, glob, project-relative path, and result limit. Returns structured matches and truncation status. |
 | `grep` | Legacy Pi factory, hidden exposure | Not model-visible. Its backend traversal is not treated as containerized. |
 | `bash` | Podman exec as mapped UID/GID | Executes user command string in project cwd with controlled proxy environment and split output capture. |
-| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }`, `{ "pkg_add": "<debian-names>" }` (one name or a space-separated string), and `{ "pkg_add": ["<debian-names>", ...] }`. Removal, upgrade, refresh, reset, and status remain user slash commands. |
+| `sandbox` | Host extension package/image management | Model-callable operations are only `{ "list": true }`, `{ "pkg_add": "<debian-names>" }` (one name or a space-separated string), `{ "pkg_add": ["<debian-names>", ...] }`, `{ "list_net": true }`, and `{ "add_net": "<destination>..." }` (a destination, a space-separated string, or a list; user popup approval required). Removal, upgrade, refresh, reset, and status remain user slash commands. |
 
 ### Host path guard
 
@@ -363,6 +363,8 @@ When an authenticated proxy request on port 80 or 443 is valid but the pair is n
 6. On `session_start` and `session_tree`, clear the mutable set, add configured CLI pairs, and replay only valid approval records from `sessionManager.getBranch()`.
 7. Concurrent requests for one pair share a pending confirmation. Different ports have different pending keys.
 
+The same flow serves the model-callable `add_net` operation: it passes normalized hostname/port through the same callback, so steps 2 to 7 apply unchanged, and a declined `add_net` popup leaves the allowlist untouched.
+
 For compatibility with earlier session entries that stored only a hostname, a missing `port` is interpreted as 443, never as both ports. Invalid approval entries are ignored.
 
 ### Proxy behavior and response codes
@@ -416,7 +418,18 @@ or a list of names:
 { "pkg_add": ["curl", "git"] }
 ```
 
-`list` returns explicit package names. `pkg_add` accepts a single base Debian package name, a space-separated string, or a non-empty list whose entries may themselves be space-separated strings. The request is parsed into one new list by splitting entries on whitespace, trimming, and dropping empty parts, and that list keeps its order and duplicates. Every entry is then checked against the strict base-name pattern before any image build starts; a rejection reports each offending entry together with its reason (qualifier, trailing separator, or malformed name). Duplicates are collapsed only when the names are merged into the stateful manifest, and the validated list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. No `remove`, `refresh`, `upgrade`, `reset`, or allowlist mutation operation is model-callable.
+or, for the network side of the same tool:
+
+```json
+{ "list_net": true }
+{ "add_net": "api.github.com" }
+{ "add_net": "api.github.com github.com:80" }
+{ "add_net": ["api.github.com", "github.com:80"] }
+```
+
+`list` returns explicit package names. `pkg_add` accepts a single base Debian package name, a space-separated string, or a non-empty list whose entries may themselves be space-separated strings. The request is parsed into one new list by splitting entries on whitespace, trimming, and dropping empty parts, and that list keeps its order and duplicates. Every entry is then checked against the strict base-name pattern before any image build starts; a rejection reports each offending entry together with its reason (qualifier, trailing separator, or malformed name). Duplicates are collapsed only when the names are merged into the stateful manifest, and the validated list is applied in one derived-image rebuild. It updates the full sorted manifest, returns a success/error result and runtime image details, and replaces the current session container if required. `list_net` returns the exact `hostname:port` pairs currently allowed through the proxy, or a stated empty result. `add_net` parses its request like `pkg_add` (one destination, a space-separated string, or a list whose entries may be space-separated), validates every entry with the destination parser, and reports all malformed entries with their reasons before any prompt is shown, so an invalid request never reaches the user as a popup. Each valid destination that is not already allowed is then confirmed individually through the interactive approval flow below: the same `Allow <hostname>:<port>?` popup, the same branch entry, and the same live Set update as a proxy-detected destination. An already-allowed destination is reported without a popup. The result reports allowed, already-allowed, and declined destinations by name; any decline makes the result an error, because nothing was added for it. It updates the full sorted manifest path only for packages; network state lives in the CLI pairs and session branch entries.
+
+No `remove`, `refresh`, `upgrade`, or `reset` operation is model-callable, and no allowlist removal or denial of a CLI-configured pair is model-callable; `add_net` is the only model-callable allowlist mutation, and it always requires the user's popup approval.
 
 ### User slash command behavior
 
@@ -468,7 +481,7 @@ The `.out/` directory is within the writable project mount. Commands may read or
 - Bash cannot write the read-only container rootfs; `/tmp`, `/var/tmp`, `/run`, and the project mount are separate writable areas.
 - Direct mapped-user TCP egress to arbitrary host ports is rejected promptly; only the host proxy address/port is accepted by nftables.
 - Proxy access requires a random token, an exact hostname/port pair, valid protocol port, successful DNS resolution to a public address, and numeric-address connection pinning.
-- Branch approvals are not injected into model context and are restored only from active session branch ancestry on startup/tree navigation.
+- Branch approvals are not injected into model context; the model sees current allowlist destinations only when it explicitly calls `list_net`, and approvals are restored only from active session branch ancestry on startup/tree navigation.
 - The native search tool bounds captured bytes and result count.
 - Long Bash output is not loaded in full into model context; only a bounded preview is returned.
 

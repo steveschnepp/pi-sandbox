@@ -618,6 +618,67 @@ export default function (pi: ExtensionAPI) {
             throw new Error(`package tool accepted mixed valid/invalid input ${JSON.stringify(pkg_add)}`);
           }
         });
+        await record("list_net reports the exact pairs allowed through the proxy", async () => {
+          const listed = await tool("sandbox", { list_net: true });
+          const destinations = listed.details.destinations as string[];
+          assert(Array.isArray(destinations), `list_net did not return a destinations list: ${JSON.stringify(listed)}`);
+          assert(destinations.every((entry) => /:\d+$/.test(entry)), `list_net returned a non host:port pair: ${JSON.stringify(destinations)}`);
+          assert(destinations.includes("approved.invalid:80"), `list_net omitted the approval persisted earlier in this session: ${JSON.stringify(destinations)}`);
+        });
+        await record("add_net adds a destination only after the user approves the popup", async () => {
+          const promptsBefore = approvalPrompts.length;
+          approvalDecision = false;
+          const declined = await tool("sandbox", { add_net: "nettool.invalid" });
+          assert(declined.isError && declined.details.exitCode === 1, `declined add_net did not report an error: ${JSON.stringify(declined)}`);
+          assert(approvalPrompts.length === promptsBefore + 1, `add_net did not ask exactly once (${approvalPrompts.length - promptsBefore} prompts)`);
+          const prompt = approvalPrompts.at(-1);
+          assert(prompt?.title === "Allow nettool.invalid:443?" && prompt.message === "", `add_net popup asked for more than the destination: ${JSON.stringify(prompt)}`);
+          const deniedList = (await tool("sandbox", { list_net: true })).details.destinations as string[];
+          assert(!deniedList.includes("nettool.invalid:443"), `declined destination reached the allowlist: ${JSON.stringify(deniedList)}`);
+          assert(!ctx.sessionManager.getBranch().some((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "nettool.invalid"), "declined destination was persisted to the session branch");
+
+          approvalDecision = true;
+          let approved: any;
+          try {
+            approved = await tool("sandbox", { add_net: "nettool.invalid" });
+          } finally {
+            approvalDecision = false;
+          }
+          assert(!approved.isError && approved.details.exitCode === 0, `approved add_net failed: ${JSON.stringify(approved)}`);
+          const text = String(approved.content[0].text);
+          assert(text.includes("allowed after the user approved the popup: nettool.invalid:443"), `add_net did not report the approved destination: ${text}`);
+          const approvals = ctx.sessionManager.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "sandbox-egress-allow" && entry.data?.hostname === "nettool.invalid" && entry.data?.port === 443);
+          assert(approvals.length === 1, `approval was not stored exactly once for nettool.invalid:443: ${approvals.length}`);
+          const allowedList = (await tool("sandbox", { list_net: true })).details.destinations as string[];
+          assert(allowedList.includes("nettool.invalid:443"), `approved destination missing from list_net: ${JSON.stringify(allowedList)}`);
+        });
+        await record("add_net takes a space separated string or a list and validates before asking", async () => {
+          const promptsBefore = approvalPrompts.length;
+          approvalDecision = true;
+          let batch: any;
+          try {
+            batch = await tool("sandbox", { add_net: "net-a.invalid net-b.invalid:80" });
+          } finally {
+            approvalDecision = false;
+          }
+          assert(!batch.isError, `space separated add_net failed: ${JSON.stringify(batch)}`);
+          assert(approvalPrompts.length === promptsBefore + 2, `space separated add_net did not ask once per destination (${approvalPrompts.length - promptsBefore} prompts)`);
+          const listed = (await tool("sandbox", { list_net: true })).details.destinations as string[];
+          assert(listed.includes("net-a.invalid:443") && listed.includes("net-b.invalid:80"), `space separated destinations missing from list_net: ${JSON.stringify(listed)}`);
+
+          const promptsBeforeInvalid = approvalPrompts.length;
+          try {
+            await tool("sandbox", { add_net: ["net-c.invalid", "bad host:22"] });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            assert(message.includes("add_net accepts DNS hostnames"), `add_net rejected malformed input for the wrong reason: ${message}`);
+            assert(message.includes("host:22"), `add_net did not name the rejected destination: ${message}`);
+            assert(message.includes("80 or :443"), `add_net did not explain why host:22 was rejected: ${message}`);
+            assert(approvalPrompts.length === promptsBeforeInvalid, "add_net asked for approval before validating the whole request");
+            return;
+          }
+          throw new Error("add_net accepted a malformed destination list");
+        });
       } finally {
         // Test fixtures are host-side resources and must not survive successful
         // runs or failed assertions.
