@@ -71,6 +71,23 @@ The global extension directory is `~/.pi/agent/extensions/`. It replaces the sta
 
 The project mount is read-write so coding changes persist. The rest of the container root filesystem is read-only; `/tmp`, `/var/tmp`, and `/run` are ephemeral tmpfs mounts. Bash can write persistently only through the current project mount. Full-output files are in the ignored project `.out/` directory.
 
+## Related Pi containerization options
+
+The [Pi v1.5.0 containerization guide](https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/docs/containerization.md) documents whole-process options such as Docker, Docker Sandboxes, and NVIDIA OpenShell, as well as tool routing through the [Gondolin example extension](https://github.com/earendil-works/pi/tree/v1.5.0/packages/coding-agent/examples/extensions/gondolin). Gondolin and this extension both keep Pi on the host and route selected operations elsewhere, but their boundaries differ:
+
+| Aspect | Gondolin example | This Podman extension |
+|--------|------------------|-----------------------|
+| Isolation backend | Local Linux micro-VM managed with QEMU. | Rootless Podman container. |
+| Built-in file tools | Routes `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` into the VM. | `bash`, `find`, and `search` run in the container; `read`, `write`, `edit`, and `ls` use host-side filesystem callbacks with project-path checks. The legacy `grep` tool is hidden. |
+| Workspace | Mounts the host working folder at `/workspace`; writes there persist to the host. | Mounts the project read-write; the container root filesystem is read-only, with ephemeral `/tmp`, `/var/tmp`, and `/run`. |
+| Network and environment | The example's VM commands inherit the host process environment; the guide warns that provider keys in environment variables can therefore be exposed. | Ordinary Bash has no direct egress and uses an authenticated proxy with an exact hostname/port allowlist. |
+| Other extensions | Extension tools remain on the host unless they explicitly delegate their work. | Other extension tools remain on the host unless they explicitly delegate their work. |
+| Setup noted by the guide | Node.js 23.6+ and QEMU. | Pi plus rootless Podman; see [Requirements](#requirements). |
+
+Podman was chosen because this extension is built around its daemonless CLI and rootless `--userns=keep-id` behavior, which keeps the Pi user's UID/GID aligned on the project bind mount. Docker also supports rootless operation; this is not a claim that Docker cannot provide isolation. Docker is not a drop-in backend here: supporting it would require a separate runtime implementation and validation of UID mapping, bind-mount ownership, networking/firewall policy, and lifecycle behavior.
+
+The key tradeoff is that Gondolin puts the routed built-in file and command tools in a micro-VM, while this project keeps its file callbacks in the host Pi process and confines only its container-backed operations. Neither approach automatically confines unrelated extension tools. Choose whole-process isolation when Pi itself and all loaded extensions must run inside the boundary.
+
 ## Package installation
 
 The embedded image includes Git, Python 3, and coding utilities. The model-callable `sandbox` tool has two package operations and two network operations. `{ "list": true }` returns only explicitly requested Debian package names, while `{ "pkg_add": "ripgrep" }` adds a package, `{ "pkg_add": "ripgrep curl" }` adds a space-separated string like a command line, and `{ "pkg_add": ["ripgrep", "curl"] }` adds a list. All three add forms are parsed into one list and applied in a single image rebuild. Packages already in the base image and transitive dependencies are not listed. For the network side, `{ "list_net": true }` returns the exact pairs currently allowed through the proxy, and `{ "add_net": "api.github.com github.com:80" }` accepts one destination, a space-separated string, or a list of them; every destination that is not already allowed is added only after the user approves its popup.
