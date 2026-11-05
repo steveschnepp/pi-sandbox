@@ -86,6 +86,8 @@ The [Pi v1.5.0 containerization guide](https://github.com/earendil-works/pi/blob
 
 Podman was chosen because this extension is built around its daemonless CLI and rootless `--userns=keep-id` behavior, which keeps the Pi user's UID/GID aligned on the project bind mount. Docker also supports rootless operation; this is not a claim that Docker cannot provide isolation. Docker is not a drop-in backend here: supporting it would require a separate runtime implementation and validation of UID mapping, bind-mount ownership, networking/firewall policy, and lifecycle behavior.
 
+The sister project [podvm](https://github.com/steveschnepp/podvm) is the VM-backed counterpart at the container-runtime layer: it is a Podman drop-in that runs OCI container workloads inside lightweight KVM VMs. The analogy is by layer: pi-sandbox is a drop-in for Pi's coding tools; podvm is a drop-in for Podman's container runtime. They stack naturally: pi-sandbox delegates tool operations through the Podman interface, and podvm supplies the VM-backed runtime boundary underneath those operations. Gondolin integrates at Pi's extension layer, while podvm integrates at the Podman layer.
+
 The key tradeoff is that Gondolin puts the routed built-in file and command tools in a micro-VM, while this project keeps its file callbacks in the host Pi process and confines only its container-backed operations. Neither approach automatically confines unrelated extension tools. Choose whole-process isolation when Pi itself and all loaded extensions must run inside the boundary.
 
 ## Package installation

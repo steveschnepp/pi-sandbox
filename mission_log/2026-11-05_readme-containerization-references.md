@@ -179,3 +179,88 @@ Final checks passed for the updated README: local Markdown links resolve, the co
 ### Next Steps
 
 - None for this request.
+
+---
+
+## Session 7: Add PodVM Reference (2026-11-05)
+
+### What We Did
+
+Added a link to the sister project podvm and described its relationship to Gondolin and this extension. Based on `~/src/podvm/README.md`, podvm runs OCI container images in lightweight KVM VMs and supports a Podman-style workflow with Podman image-storage compatibility. Clarified that podvm is a VM-backed container runtime, not a Pi extension that directly routes Pi's built-in tools; that integration would require an adapter or extension.
+
+### What We Decided
+
+- Present podvm as the VM-backed sibling option and link its public homepage.
+- Distinguish runtime/image compatibility from direct Pi extension integration; do not imply that podvm currently supplies a Gondolin-like Pi extension.
+
+### Test Results / Benchmarks
+
+- Pending Markdown link, ASCII, and diff checks.
+
+### Next Steps
+
+- Validate the README change and record the repository's existing mission-log lint status.
+
+---
+
+## Session 8: Clarify PodVM Drop-In Layer (2026-11-05)
+
+### What We Did
+
+Corrected the README's PodVM description after the user clarified that podvm is a Podman drop-in, not merely a related VM-backed runtime. The text now parallels the integration layers: pi-sandbox drops in for Pi's coding tools, while podvm drops in for Podman's container runtime and supplies the KVM VM boundary. It describes the projects as complementary, with Gondolin integrating at Pi's extension layer and podvm at the Podman layer.
+
+### What We Decided
+
+- State PodVM's Podman drop-in role directly and avoid suggesting a separate Pi adapter is required for the intended layering.
+- Keep the analogy focused on where each project plugs into the stack.
+
+### Test Results / Benchmarks
+
+- Pending final README and diff checks.
+
+### Next Steps
+
+- Validate local links, the changed section's ASCII-7 text, and `git diff --check`.
+
+---
+
+## Session 9: State PodVM and Pi-Sandbox Composition (2026-11-05)
+
+### What We Did
+
+Strengthened the README wording to state that pi-sandbox and podvm stack naturally: pi-sandbox delegates tool operations through the Podman interface, while podvm replaces the runtime beneath that interface and supplies the KVM VM boundary. This follows the user's clarification that the two projects compose at adjacent layers.
+
+### What We Decided
+
+- Describe the relationship as a practical stack, not only as two complementary options.
+
+### Test Results / Benchmarks
+
+- Pending final checks.
+
+### Next Steps
+
+- Validate the README diff and the mission-log directory with the correct lint path.
+
+---
+
+## Session 10: Validate PodVM Stack Wording (2026-11-05)
+
+### What We Did
+
+Validated the updated PodVM composition wording. `git diff --check` passed, local README links resolved, and the added comparison section is ASCII-7. The new mission log passes lint. Directory-wide lint still reports 11 pre-existing errors in two older mission logs; those files remain unchanged.
+
+### What We Decided
+
+- Retain the explicit stack description: Pi-sandbox is the Pi-tools drop-in and PodVM is the Podman-runtime drop-in beneath it.
+
+### Test Results / Benchmarks
+
+- `git diff --check`: passed.
+- README local Markdown links: passed.
+- Added comparison section ASCII-7: passed.
+- Mission-log lint: new log passed; directory lint reports 11 pre-existing errors across two older logs.
+
+### Next Steps
+
+- None for this clarification.
